@@ -1,6 +1,7 @@
 import logging
 import os
 import tempfile
+import time
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pdf2image.exceptions import (
@@ -23,12 +24,15 @@ async def ocr_pdf(
     file: UploadFile = File(...),
     pipeline: DocumentPipeline = Depends(get_pipeline),
 ) -> OCRResponse:
+    t_request = time.time()
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only .pdf files are supported")
 
+    t_read = time.time()
     pdf_bytes = await file.read()
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    logger.info("Read upload body: %.2fs (%d bytes)", time.time() - t_read, len(pdf_bytes))
 
     tmp_path = None
     try:
@@ -48,4 +52,10 @@ async def ocr_pdf(
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    return OCRResponse(file=result["json"]["file"], json=result["json"], markdown=result["markdown"])
+    t_response = time.time()
+    response = OCRResponse(file=result["json"]["file"], json=result["json"], markdown=result["markdown"])
+    logger.info(
+        "Route %s done: total=%.2fs (upload_read included, build_response=%.2fs)",
+        file.filename, time.time() - t_request, time.time() - t_response,
+    )
+    return response

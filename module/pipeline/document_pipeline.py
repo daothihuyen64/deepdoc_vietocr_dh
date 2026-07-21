@@ -52,14 +52,17 @@ class DocumentPipeline:
 
         pages_blocks = [self._process_page(pn, img, debug_dir) for pn, img in enumerate(pages)]
 
+        t_build = time.time()
         markdown = build_markdown(pages_blocks, self.layout.label_schema)
+        json_out = build_json(label, pages_blocks)
+        logger.info("Built JSON/markdown output in %.2fs", time.time() - t_build)
 
         if debug_dir:
             with open(os.path.join(debug_dir, "output.md"), "w", encoding="utf-8") as f:
                 f.write(markdown)
 
         return {
-            "json": build_json(label, pages_blocks),
+            "json": json_out,
             "markdown": markdown,
         }
 
