@@ -2,7 +2,7 @@
 <html lang="vi">
 <head>
 <meta charset="utf-8">
-<title>DeepDoc VietOCR</title>
+<title>FastOCR</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -12,36 +12,56 @@
     color: #1a1a1a; background: #f5f5f5;
   }
   header {
-    padding: 10px 16px;
-    background: #1f2937; color: #fff;
-    font-size: 16px; font-weight: 600;
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 20px;
+    background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff;
+    font-size: 17px; font-weight: 700;
+    letter-spacing: .01em;
+    box-shadow: 0 1px 4px rgba(0,0,0,.15);
+  }
+  header .logo {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 7px;
+    background: rgba(255,255,255,.18);
+    font-size: 14px;
   }
   .layout {
     display: flex;
-    height: calc(100% - 42px);
+    height: calc(100% - 50px);
   }
   .col {
     overflow-y: auto;
-    padding: 14px;
-    border-right: 1px solid #ddd;
+    padding: 16px;
+    border-right: 1px solid #e5e7eb;
     background: #fff;
   }
   .col:last-child { border-right: none; }
-  .col-upload { flex: 0 0 260px; }
+  .col-upload { flex: 0 0 300px; }
   .col-json, .col-md { flex: 1 1 0; min-width: 0; }
   h2 {
     font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
-    color: #666; margin: 0 0 10px;
+    color: #666; margin: 0 0 12px;
   }
   .dropzone {
-    border: 2px dashed #bbb; border-radius: 8px;
-    padding: 24px 10px; text-align: center; color: #777;
-    font-size: 13px; cursor: pointer; transition: border-color .15s;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    border: 2px dashed #cbd5e1; border-radius: 10px;
+    padding: 28px 14px; text-align: center; color: #64748b;
+    font-size: 12.5px; line-height: 1.5; cursor: pointer;
+    transition: border-color .15s, background-color .15s;
+    background: #f8fafc;
   }
+  .dropzone:hover { border-color: #93c5fd; background: #f0f7ff; }
   .dropzone.drag { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+  .dropzone svg { width: 30px; height: 30px; stroke: #94a3b8; flex-shrink: 0; }
+  .dropzone.drag svg, .dropzone:hover svg { stroke: #2563eb; }
+  .dropzone .main-txt { font-weight: 600; color: #334155; font-size: 13.5px; }
+  .dropzone.drag .main-txt, .dropzone:hover .main-txt { color: #2563eb; }
+  .dropzone .sub-txt { color: #94a3b8; }
   input[type=file] { display: none; }
   .filename {
-    margin-top: 10px; font-size: 13px; color: #333;
+    margin-top: 12px; padding: 8px 10px;
+    background: #f1f5f9; border-radius: 6px;
+    font-size: 12.5px; color: #334155;
     word-break: break-all;
   }
   button {
@@ -62,7 +82,7 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   pre#jsonOut {
     margin: 0; font-size: 12.5px; line-height: 1.5;
-    white-space: pre-wrap; word-break: break-word;
+    white-space: pre-wrap; overflow-wrap: break-word;
     font-family: ui-monospace, Consolas, monospace;
   }
   .md-body { font-size: 14px; line-height: 1.6; }
@@ -74,12 +94,18 @@
 </style>
 </head>
 <body>
-<header>DeepDoc VietOCR — Test pipeline</header>
+<header><span class="logo">⚡</span>FastOCR</header>
 <div class="layout">
   <div class="col col-upload">
     <h2>Upload PDF</h2>
     <label class="dropzone" id="dropzone">
-      Kéo thả file .pdf vào đây<br>hoặc bấm để chọn file
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7 18a4.6 4.4 0 0 1-1.9-8.8 5 4.5 0 0 1 9.9-1A4.5 4.5 0 0 1 17 18H7Z"></path>
+        <path d="M12 12v6"></path>
+        <path d="M9.5 14.5 12 12l2.5 2.5"></path>
+      </svg>
+      <span class="main-txt">Bấm để chọn file</span>
+      <span class="sub-txt">hoặc kéo thả file .pdf vào đây</span>
       <input type="file" id="fileInput" accept="application/pdf,.pdf">
     </label>
     <div class="filename" id="filename"></div>
