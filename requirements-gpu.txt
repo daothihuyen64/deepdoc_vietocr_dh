@@ -1,8 +1,6 @@
 numpy
 opencv-python
-onnxruntime
-torch
-torchvision
+onnxruntime-gpu
 einops
 matplotlib
 Pillow
@@ -16,6 +14,5 @@ six
 fastapi
 uvicorn[standard]
 python-multipart
-paddlepaddle==3.0.0
 paddleocr
 pdf2image

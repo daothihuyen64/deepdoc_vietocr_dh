@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>DeepDoc VietOCR</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    color: #1a1a1a; background: #f5f5f5;
+  }
+  header {
+    padding: 10px 16px;
+    background: #1f2937; color: #fff;
+    font-size: 16px; font-weight: 600;
+  }
+  .layout {
+    display: flex;
+    height: calc(100% - 42px);
+  }
+  .col {
+    overflow-y: auto;
+    padding: 14px;
+    border-right: 1px solid #ddd;
+    background: #fff;
+  }
+  .col:last-child { border-right: none; }
+  .col-upload { flex: 0 0 260px; }
+  .col-json, .col-md { flex: 1 1 0; min-width: 0; }
+  h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
+    color: #666; margin: 0 0 10px;
+  }
+  .dropzone {
+    border: 2px dashed #bbb; border-radius: 8px;
+    padding: 24px 10px; text-align: center; color: #777;
+    font-size: 13px; cursor: pointer; transition: border-color .15s;
+  }
+  .dropzone.drag { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+  input[type=file] { display: none; }
+  .filename {
+    margin-top: 10px; font-size: 13px; color: #333;
+    word-break: break-all;
+  }
+  button {
+    margin-top: 12px; width: 100%; padding: 9px 0;
+    background: #2563eb; color: #fff; border: none; border-radius: 6px;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #9ca3af; cursor: not-allowed; }
+  .status { margin-top: 10px; font-size: 13px; }
+  .status.err { color: #b91c1c; white-space: pre-wrap; }
+  .status.ok { color: #15803d; }
+  .spinner {
+    display: inline-block; width: 13px; height: 13px;
+    border: 2px solid #c7d2fe; border-top-color: #2563eb;
+    border-radius: 50%; animation: spin .7s linear infinite;
+    vertical-align: -2px; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  pre#jsonOut {
+    margin: 0; font-size: 12.5px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .md-body { font-size: 14px; line-height: 1.6; }
+  .md-body table { border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+  .md-body th, .md-body td { border: 1px solid #ccc; padding: 4px 8px; }
+  .md-body h1 { font-size: 20px; }
+  .md-body h2 { font-size: 16px; text-transform: none; letter-spacing: 0; color: inherit; }
+  .placeholder { color: #999; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>DeepDoc VietOCR — Test pipeline</header>
+<div class="layout">
+  <div class="col col-upload">
+    <h2>Upload PDF</h2>
+    <label class="dropzone" id="dropzone">
+      Kéo thả file .pdf vào đây<br>hoặc bấm để chọn file
+      <input type="file" id="fileInput" accept="application/pdf,.pdf">
+    </label>
+    <div class="filename" id="filename"></div>
+    <button id="submitBtn" disabled>Xử lý</button>
+    <div class="status" id="status"></div>
+  </div>
+  <div class="col col-json">
+    <h2>JSON</h2>
+    <pre id="jsonOut"><span class="placeholder">Chưa có kết quả</span></pre>
+  </div>
+  <div class="col col-md">
+    <h2>Markdown</h2>
+    <div class="md-body" id="mdOut"><span class="placeholder">Chưa có kết quả</span></div>
+  </div>
+</div>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const filenameEl = document.getElementById('filename');
+const submitBtn = document.getElementById('submitBtn');
+const statusEl = document.getElementById('status');
+const jsonOut = document.getElementById('jsonOut');
+const mdOut = document.getElementById('mdOut');
+
+let selectedFile = null;
+
+function setFile(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.pdf')) {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'Chỉ chấp nhận file .pdf';
+    return;
+  }
+  selectedFile = file;
+  filenameEl.textContent = file.name + '  (' + (file.size / 1024).toFixed(0) + ' KB)';
+  submitBtn.disabled = false;
+  statusEl.className = 'status';
+  statusEl.textContent = '';
+}
+
+fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+
+['dragenter', 'dragover'].forEach(evt =>
+  dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('drag'); })
+);
+['dragleave', 'drop'].forEach(evt =>
+  dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('drag'); })
+);
+dropzone.addEventListener('drop', e => {
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  setFile(file);
+});
+
+submitBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  submitBtn.disabled = true;
+  statusEl.className = 'status';
+  statusEl.innerHTML = '<span class="spinner"></span>Đang xử lý...';
+  jsonOut.innerHTML = '<span class="placeholder">Đang xử lý...</span>';
+  mdOut.innerHTML = '<span class="placeholder">Đang xử lý...</span>';
+
+  const formData = new FormData();
+  formData.append('file', selectedFile);
+
+  try {
+    const res = await fetch('/api/v1/ocr/pdf', {
+      method: 'POST',
+      body: formData,
+      // Bypasses ngrok's free-tier HTML warning interstitial, which
+      // otherwise intercepts non-navigation requests (fetch/XHR) and
+      // returns an HTML page instead of the actual JSON response.
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.detail || ('HTTP ' + res.status));
+    }
+
+    statusEl.className = 'status ok';
+    statusEl.textContent = 'Xong: ' + data.file;
+
+    jsonOut.textContent = JSON.stringify(data.json, null, 2);
+
+    if (window.marked) {
+      mdOut.innerHTML = marked.parse(data.markdown || '');
+    } else {
+      const pre = document.createElement('pre');
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.textContent = data.markdown || '';
+      mdOut.innerHTML = '';
+      mdOut.appendChild(pre);
+    }
+  } catch (err) {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'Lỗi: ' + err.message;
+    jsonOut.innerHTML = '<span class="placeholder">Chưa có kết quả</span>';
+    mdOut.innerHTML = '<span class="placeholder">Chưa có kết quả</span>';
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

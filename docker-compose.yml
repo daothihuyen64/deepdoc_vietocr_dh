@@ -1,0 +1,17 @@
+services:
+  ocr-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./pipeline_outputs:/app/pipeline_outputs
+      - ./debug_outputs:/app/debug_outputs
+      # Optional: if you create conf/local.pipeline_conf.yaml on the host to
+      # override weight paths/thresholds without rebuilding the image,
+      # uncomment the line below (mounting a file that doesn't exist yet
+      # makes Docker create an empty directory there instead, which breaks
+      # config loading).
+      - ./conf/local.pipeline_conf.yaml:/app/conf/local.pipeline_conf.yaml:ro
+      # Live-mounted so swapping vietocr_weight_path to a new .pth file only
+      # needs `docker compose restart`, not a rebuild.
+      - ./vietocr/weight:/app/vietocr/weight:ro

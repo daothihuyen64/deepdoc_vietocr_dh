@@ -1,0 +1,44 @@
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+
+# Ubuntu 22.04 ships Python 3.10 by default -- fine, the codebase only needs
+# 3.10+ (uses `int | None` union syntax).
+# poppler-utils: required by pdf2image to rasterize PDFs.
+# libgl1/libglib2.0-0/libsm6/libxext6/libxrender1: required by opencv-python.
+# libgomp1: required by onnxruntime.
+# fonts-dejavu-core: Vietnamese-capable TTF used to label debug bbox overlays.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /app
+
+COPY requirements-gpu.txt .
+# CUDA-enabled torch/torchvision and PaddlePaddle's own GPU build (PaddlePaddle
+# isn't on PyPI for GPU -- it has its own CUDA-matched package index) --
+# installed first, matching the base image's CUDA 12.6, so the later
+# `-r requirements-gpu.txt` pass sees them already satisfied and leaves them
+# alone. Bump the cu126 index/version here if the base image's CUDA version
+# above changes.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu126 \
+    && pip install --no-cache-dir paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
+    && pip install --no-cache-dir -r requirements-gpu.txt
+
+COPY . .
+
+# Pre-download PP-DocLayout weights at build time so the container's first
+# request doesn't stall on a cold download.
+RUN python -c "from paddleocr import LayoutDetection; LayoutDetection(model_name='PP-DocLayout_plus-L')"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]

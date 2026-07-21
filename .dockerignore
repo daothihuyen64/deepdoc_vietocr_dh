@@ -1,0 +1,13 @@
+.git
+.gitattributes
+__pycache__
+**/__pycache__
+*.pyc
+log
+pipeline_outputs
+pipeline_outputs.zip
+debug_outputs
+*.ipynb
+img
+.venv
+venv
