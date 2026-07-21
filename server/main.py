@@ -1,15 +1,21 @@
 import logging
-from contextlib import asynccontextmanager
-from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-
-from module.pipeline import build_pipeline
-
-from . import routes
-
+# Must run before any other import (paddle/paddlex configure the root
+# logger as a side effect of import, which makes basicConfig() a silent
+# no-op if it runs after them -- our own INFO logs would then vanish while
+# uvicorn's independently-configured access logs still show up fine).
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+from contextlib import asynccontextmanager  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+from module.pipeline import build_pipeline  # noqa: E402
+
+from . import routes  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
