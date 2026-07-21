@@ -40,9 +40,10 @@ class DocumentPipeline:
         self.config = config
 
     def process_pdf(self, pdf_path: str, source_filename: str | None = None) -> dict:
+        t_render = time.time()
         pages = load_pdf_pages(pdf_path, dpi=self.config.pdf_dpi)
         label = source_filename or os.path.basename(pdf_path)
-        logger.info("Processing %s (%d pages)", label, len(pages))
+        logger.info("Processing %s (%d pages) | pdf_render=%.2fs", label, len(pages), time.time() - t_render)
 
         debug_dir = None
         if self.config.debug_enabled:
@@ -66,6 +67,14 @@ class DocumentPipeline:
         cfg = self.config
         label_schema = self.layout.label_schema
         t0 = time.time()
+        timings: dict[str, float] = {}
+        t_stage = t0
+
+        def _mark(name: str) -> None:
+            nonlocal t_stage
+            now = time.time()
+            timings[name] = now - t_stage
+            t_stage = now
 
         if cfg.crop_whitespace_enabled:
             orig_size = img.size
@@ -81,6 +90,7 @@ class DocumentPipeline:
             )
             if img.size != orig_size:
                 logger.debug("Page %d: whitespace-cropped %s -> %s", pn + 1, orig_size, img.size)
+        _mark("whitespace_crop")
 
         w, h = img.size
 
@@ -88,8 +98,10 @@ class DocumentPipeline:
             save_input_image(img, debug_dir, pn)
 
         raw_blocks = self.layout.detect(img, cfg.layout_threshold)
+        _mark("layout_detect")
         page_crop_debug_dir = os.path.join(debug_dir, f"page_{pn + 1}_vietocr_crops") if debug_dir else None
         ocr_boxes = run_ocr_page(img, self.ocr, crop_debug_dir=page_crop_debug_dir)
+        _mark("ocr_page")
 
         if debug_dir:
             save_layout_debug(img, raw_blocks, debug_dir, pn)
@@ -123,6 +135,7 @@ class DocumentPipeline:
                 blocks.append({**b, "content_type": "skip", "content": None})
             else:
                 blocks.append({**b, "content_type": "text", "content": None})
+        _mark("tables")
 
         blocks = dedup_nested_blocks(blocks)
         unmatched = map_text_to_blocks(ocr_boxes, blocks, label_schema.skip_types, cfg.map_overlap_threshold)
@@ -153,6 +166,7 @@ class DocumentPipeline:
             extra_blocks = unmatched_to_blocks(unmatched)
             blocks.extend(extra_blocks)
             logger.debug("Page %d: %d OCR boxes unmatched -> %d extra blocks", pn + 1, len(unmatched), len(extra_blocks))
+        _mark("mapping")
 
         for b in blocks:
             if b["content_type"] == "text":
@@ -163,6 +177,7 @@ class DocumentPipeline:
                     if line:
                         line_texts.append(line)
                 b["content"] = build_block_content(line_texts)
+        _mark("content_build")
 
         blocks = sort_reading_order(
             blocks, img_width=w, img_height=h,
@@ -172,13 +187,15 @@ class DocumentPipeline:
             single_page_ratio_max=cfg.single_page_ratio_max,
             spanning_min_ratio=cfg.spanning_min_ratio,
         )
+        _mark("reading_order")
 
         elapsed = time.time() - t0
         n_tbl = sum(1 for b in blocks if b["content_type"] == "table")
         n_text = sum(1 for b in blocks if b["content_type"] == "text")
+        timings_str = " ".join(f"{k}={v:.2f}s" for k, v in timings.items())
         logger.info(
-            "Page %d done in %.1fs: layout=%d ocr=%d table=%d text=%d",
-            pn + 1, elapsed, len(raw_blocks), len(ocr_boxes), n_tbl, n_text,
+            "Page %d done in %.1fs: layout=%d ocr=%d table=%d text=%d | %s",
+            pn + 1, elapsed, len(raw_blocks), len(ocr_boxes), n_tbl, n_text, timings_str,
         )
 
         return blocks
