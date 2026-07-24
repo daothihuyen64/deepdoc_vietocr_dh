@@ -62,7 +62,7 @@ reading_order:
   anchor_band_mult: 1.0
 
 output:
-  dir: "./pipeline_outputs_v2_b08d151_fix_xoay_anh_va_bang"
+  dir: "./pipeline_outputs_v2_b08d151c125c048d8b60c52799af2fbd0da88593_fix_xoay_anh_va_bang"
 
 debug:
   enabled: true
