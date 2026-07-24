@@ -1,7 +1,9 @@
+import asyncio
 import logging
 import os
 import tempfile
 import time
+from functools import partial
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pdf2image.exceptions import (
@@ -40,7 +42,14 @@ async def ocr_pdf(
             tmp.write(pdf_bytes)
             tmp_path = tmp.name
 
-        result = pipeline.process_pdf(tmp_path, source_filename=file.filename)
+        # process_pdf is synchronous CPU/GPU-bound work -- run it in a
+        # worker thread so it doesn't block the asyncio event loop for its
+        # whole duration (a direct call here would stall every other
+        # request, including just reading a new request's body, until this
+        # one finishes).
+        result = await asyncio.to_thread(
+            partial(pipeline.process_pdf, tmp_path, source_filename=file.filename)
+        )
     except (PDFPageCountError, PDFSyntaxError, PDFInfoNotInstalledError) as e:
         raise HTTPException(status_code=422, detail=f"Unable to read PDF: {e}") from e
     except HTTPException:

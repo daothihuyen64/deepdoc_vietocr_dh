@@ -106,6 +106,14 @@ class MinerUTableProcessor:
         dt_boxes, _ = self._text_det(bgr)
         if dt_boxes is None or len(dt_boxes) == 0:
             return []
+        # MinerU's wireless-table matcher (matcher.py::match_result) appends
+        # OCR fragments to a cell in WHATEVER order dt_boxes arrives in --
+        # no positional re-sort of its own (unlike the wired/UNet path,
+        # which does sort_and_gather_ocr_res internally). Raw detector
+        # output order isn't reading order, so without this the OCR result
+        # order silently becomes the final cell-text order once a cell
+        # holds more than one fragment.
+        dt_boxes = self._ocr.sorted_boxes(dt_boxes)
 
         result = []
         for box in dt_boxes:
@@ -168,7 +176,14 @@ class MinerUTableProcessor:
             final_html = wireless_html
             if debug_dir and self._tsr is not None:
                 logger.info("Page %d table %d: wireless -> writing tsr comparison", pn + 1, tno)
-                self._save_tsr_compare(img, ocr_result, wireless_html, debug_dir, pn, tno)
+                try:
+                    self._save_tsr_compare(img, ocr_result, wireless_html, debug_dir, pn, tno)
+                except Exception:
+                    # This is a side, manual-comparison-only debug aid (see
+                    # class docstring) -- it must NEVER take down the real
+                    # request/result just because the "tsr" backend it
+                    # borrows for comparison hit an unrelated problem.
+                    logger.exception("Page %d table %d: tsr comparison failed, skipping it", pn + 1, tno)
             elif debug_dir:
                 logger.info("Page %d table %d: wireless but no tsr backend loaded (debug was off at startup?) -- skipping comparison", pn + 1, tno)
 
