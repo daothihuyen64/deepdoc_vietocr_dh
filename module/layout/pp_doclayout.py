@@ -14,15 +14,20 @@ class PPDocLayoutBackend:
     Replaces DeepDoc's own YOLOv10 layout model, which is no longer used.
     """
 
+    # The 20 real labels PP-DocLayout_plus-L outputs (from its own
+    # inference.yml label_list, ground truth -- not the model's own docs
+    # summary, which is looser): paragraph_title, image, text, number,
+    # abstract, content, figure_title, formula, table, reference, doc_title,
+    # footnote, header, algorithm, footer, seal, chart, formula_number,
+    # aside_text, reference_content. Anything below not in this list is a
+    # typo/dead entry that can never match real model output.
     label_schema = LayoutLabelSchema(
-        table_types=frozenset({"table", "table_caption", "table_footnote"}),
+        table_types=frozenset({"table"}),
         skip_types=frozenset({
-            "seal", "figure", "image", "chart", "abandon",
-            "figure_caption", "figure_title", "header_image", "footer_image",
-            "formula", "isolate_formula", "formula_caption", "formula_number",
-            "algorithm", "header", "footer", "page_number",
+            "seal", "image", "chart", "formula", "formula_number",
+            "algorithm", "number", "aside_text", "footnote",
         }),
-        title_types=frozenset({"document_title", "title"}),
+        title_types=frozenset({"doc_title"}),
         h2_types=frozenset({"paragraph_title"}),
     )
 

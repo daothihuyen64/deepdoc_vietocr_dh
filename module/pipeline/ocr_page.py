@@ -10,8 +10,19 @@ from ..ocr import OCREngine
 from .types import OCRBox
 
 
-def run_ocr_page(img_pil: Image.Image, ocr: OCREngine, crop_debug_dir: str | None = None) -> list[OCRBox]:
+def run_ocr_page(
+    img_pil: Image.Image,
+    ocr: OCREngine,
+    crop_debug_dir: str | None = None,
+    dt_boxes: np.ndarray | None = None,
+    prerecognized: dict[int, tuple[str, float]] | None = None,
+) -> list[OCRBox]:
     """Runs detection + recognition ONCE for the whole page.
+
+    `dt_boxes`/`prerecognized`, when given, come from page_orientation.py having
+    already detected (and, for a sampled subset, recognized) boxes on this EXACT
+    image while scoring 0/90/270 candidates -- skips re-running the detector
+    entirely, and only recognizes whichever boxes weren't in that sample.
 
     Returns ocr_boxes with 'bbox' (raw), 'bbox_row' (virtual bbox counter-
     rotated by the page's estimated skew angle -- used as a row-grouping
@@ -22,25 +33,40 @@ def run_ocr_page(img_pil: Image.Image, ocr: OCREngine, crop_debug_dir: str | Non
     img_bgr = cv2.cvtColor(np.array(img_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
     ori_im = img_bgr.copy()
 
-    dt_boxes, _ = ocr.text_detector[0](img_bgr)
-    if dt_boxes is None or len(dt_boxes) == 0:
+    if dt_boxes is None:
+        dt_boxes, _ = ocr.text_detector[0](img_bgr)
+        if dt_boxes is None or len(dt_boxes) == 0:
+            return []
+        dt_boxes = ocr.sorted_boxes(dt_boxes)
+    elif len(dt_boxes) == 0:
         return []
-    dt_boxes = ocr.sorted_boxes(dt_boxes)
 
+    prerecognized = prerecognized or {}
     img_crop_list = []
+    crop_indices = []
     for bno in range(len(dt_boxes)):
+        if bno in prerecognized:
+            continue
         tmp_box = copy.deepcopy(dt_boxes[bno])
         img_crop_list.append(ocr.get_rotate_crop_image(ori_im, tmp_box))
+        crop_indices.append(bno)
 
     # Dumps the EXACT crops handed to the recognizer below (post crop
     # padding/rotate-90 decision) -- for debugging what VietOCR actually
-    # sees per box, not a reconstruction of it.
+    # sees per box, not a reconstruction of it. Boxes reused from
+    # page_orientation.py's sample aren't re-cropped, so they won't appear here.
     if crop_debug_dir:
         os.makedirs(crop_debug_dir, exist_ok=True)
-        for bno, img_crop in enumerate(img_crop_list):
+        for bno, img_crop in zip(crop_indices, img_crop_list):
             cv2.imwrite(os.path.join(crop_debug_dir, f"{bno}.png"), img_crop)
 
-    rec_res, _ = ocr.text_recognizer[0](img_crop_list)
+    fresh_rec_res, _ = ocr.text_recognizer[0](img_crop_list) if img_crop_list else ([], 0.0)
+
+    rec_res: list[tuple[str, float] | None] = [None] * len(dt_boxes)
+    for bno, res in prerecognized.items():
+        rec_res[bno] = res
+    for bno, res in zip(crop_indices, fresh_rec_res):
+        rec_res[bno] = res
 
     def _skew_of_quad(box, min_width=100):
         p0, p1, p2, p3 = box

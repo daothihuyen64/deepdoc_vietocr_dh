@@ -150,6 +150,22 @@ def split_side(bbox: list[float], split_x: float, min_spanning_ratio: float = 0.
     return "left" if left_ratio >= right_ratio else "right"
 
 
+def _merge_by_y0(ordered: list[PageBlock], extra: list[PageBlock]) -> list[PageBlock]:
+    """Splices `extra` (sorted by bbox y0) into `ordered` at the position
+    matching its own y0, without disturbing `ordered`'s existing relative
+    order."""
+    if not extra:
+        return ordered
+    result, ei = [], 0
+    for b in ordered:
+        while ei < len(extra) and extra[ei]["bbox"][1] <= b["bbox"][1]:
+            result.append(extra[ei])
+            ei += 1
+        result.append(b)
+    result.extend(extra[ei:])
+    return result
+
+
 def sort_reading_order(
     blocks: list[PageBlock],
     img_width: float,
@@ -160,29 +176,35 @@ def sort_reading_order(
     single_page_ratio_max: float = 0.85,
     spanning_min_ratio: float = 0.15,
 ) -> list[PageBlock]:
-    """Orders blocks for reading on a single page."""
+    """Orders blocks for reading on a single page.
+
+    'skip' blocks (image/figure/formula/seal/... -- never have content, see
+    label_schema.skip_types) are pulled out before row-grouping and spliced
+    back in by their own y0 afterward: a page-spanning image/background
+    block would otherwise Y-overlap with nearly every other block and drag
+    them all into a single reading-order "row", collapsing the whole page's
+    order down to a left-to-right sort by x0 alone.
+    """
+    skip_blocks = [b for b in blocks if b.get("content_type") == "skip"]
+    orderable = [b for b in blocks if b.get("content_type") != "skip"]
+
     if not is_double_page(img_width, img_height, single_page_ratio_max):
-        return _tb(blocks, overlap_min, band_mult, anchor_min_width)
+        ordered = _tb(orderable, overlap_min, band_mult, anchor_min_width)
+    else:
+        split_x = img_width / 2
+        left, right, spanning = [], [], []
+        for b in orderable:
+            side = split_side(b["bbox"], split_x, spanning_min_ratio)
+            if side == "spanning":
+                spanning.append(b)
+            elif side == "left":
+                left.append(b)
+            else:
+                right.append(b)
 
-    split_x = img_width / 2
-    left, right, spanning = [], [], []
-    for b in blocks:
-        side = split_side(b["bbox"], split_x, spanning_min_ratio)
-        if side == "spanning":
-            spanning.append(b)
-        elif side == "left":
-            left.append(b)
-        else:
-            right.append(b)
+        col_ordered = _tb(left, overlap_min, band_mult, anchor_min_width) + _tb(right, overlap_min, band_mult, anchor_min_width)
+        spanning_sorted = sorted(spanning, key=lambda b: b["bbox"][1])
+        ordered = _merge_by_y0(col_ordered, spanning_sorted)
 
-    ordered = _tb(left, overlap_min, band_mult, anchor_min_width) + _tb(right, overlap_min, band_mult, anchor_min_width)
-    spanning_sorted = sorted(spanning, key=lambda b: b["bbox"][1])
-
-    result, si = [], 0
-    for b in ordered:
-        while si < len(spanning_sorted) and spanning_sorted[si]["bbox"][1] <= b["bbox"][1]:
-            result.append(spanning_sorted[si])
-            si += 1
-        result.append(b)
-    result.extend(spanning_sorted[si:])
-    return result
+    skip_sorted = sorted(skip_blocks, key=lambda b: b["bbox"][1])
+    return _merge_by_y0(ordered, skip_sorted)

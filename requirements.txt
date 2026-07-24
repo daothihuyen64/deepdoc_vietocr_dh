@@ -19,3 +19,5 @@ python-multipart
 paddlepaddle==3.0.0
 paddleocr
 pdf2image
+mineru[pipeline]
+loguru

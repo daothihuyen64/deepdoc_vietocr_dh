@@ -15,7 +15,7 @@ class Predictor:
         self.vocab = vocab
         self.device = device
 
-    def predict(self, img):
+    def predict(self, img, return_prob=False):
         img = process_input(
             img,
             self.config['dataset']['image_height'],
@@ -24,5 +24,9 @@ class Predictor:
         )
         img = img.to(self.device)
 
-        s = translate(img, self.model)[0].tolist()
-        return self.vocab.decode(s)
+        sent, prob = translate(img, self.model)
+        text = self.vocab.decode(sent[0].tolist())
+
+        if return_prob:
+            return text, float(prob[0])
+        return text

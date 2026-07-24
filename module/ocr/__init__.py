@@ -10,6 +10,7 @@ def get_ocr_engine(conf: dict) -> OCR:
         vietocr_base_config=ocr_conf.get("vietocr_base_config"),
         crop_pad_px_h=ocr_conf.get("crop_pad_px_h", 3.0),
         crop_pad_px_w=ocr_conf.get("crop_pad_px_w", 0.0),
+        det_backend=ocr_conf.get("det_backend", "onnx"),
     )
 
 

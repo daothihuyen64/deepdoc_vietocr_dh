@@ -9,14 +9,15 @@ from PIL import Image
 
 from ..layout import LayoutBackend, get_layout_backend
 from ..ocr import OCREngine, get_ocr_engine
-from ..tsr import TSRBackend, get_tsr_backend
+from ..table import TableProcessor, get_table_processor
 from .config import PipelineConfig, load_pipeline_conf
 from .content import build_block_content, build_json, build_markdown
-from .debug import save_input_image, save_layout_debug, save_ocr_debug, save_table_crop, save_table_ocr_debug
+from .debug import save_input_image, save_layout_debug, save_ocr_debug, save_table_crop
 from .loader import load_pdf_pages
 from .ocr_page import run_ocr_page
+from .page_orientation import correct_page_orientation, deskew_page
 from .reading_order import sort_reading_order, tb_rows
-from .table import deskew_crop, raw_ocr, table_to_markdown
+from .table import deskew_crop
 from .text_mapping import (
     dedup_nested_blocks,
     map_text_to_blocks,
@@ -35,10 +36,10 @@ class DocumentPipeline:
     dependency-injected so any of them can be swapped for a different
     implementation without touching this class."""
 
-    def __init__(self, layout: LayoutBackend, ocr: OCREngine, tsr: TSRBackend, config: PipelineConfig):
+    def __init__(self, layout: LayoutBackend, ocr: OCREngine, table_processor: TableProcessor, config: PipelineConfig):
         self.layout = layout
         self.ocr = ocr
-        self.tsr = tsr
+        self.table_processor = table_processor
         self.config = config
 
     def process_pdf(self, pdf_path: str, source_filename: str | None = None) -> dict:
@@ -105,6 +106,33 @@ class DocumentPipeline:
                 logger.debug("Page %d: whitespace-cropped %s -> %s", pn + 1, orig_size, img.size)
         _mark("whitespace_crop")
 
+        if cfg.page_deskew_enabled:
+            img, tilt_angle = deskew_page(
+                img, self.ocr,
+                min_boxes=cfg.page_deskew_min_boxes,
+                angle_threshold=cfg.page_deskew_angle_threshold,
+                max_angle=cfg.page_deskew_max_angle,
+            )
+            if tilt_angle:
+                logger.info("Page %d: deskewed by %.2f°", pn + 1, tilt_angle)
+        _mark("page_deskew")
+
+        dt_boxes_reuse, prerecognized_reuse = None, None
+        if cfg.page_orientation_enabled:
+            img, orient_label, orient_score, dt_boxes_reuse, prerecognized_reuse = correct_page_orientation(
+                img, self.ocr,
+                score_threshold=cfg.page_orientation_score_threshold,
+                sample_max=cfg.page_orientation_sample_max,
+                min_scores=cfg.page_orientation_min_scores,
+                sideways_min_count=cfg.page_orientation_sideways_min_count,
+                sideways_min_ratio=cfg.page_orientation_sideways_min_ratio,
+            )
+            if orient_score is None:
+                logger.info("Page %d: orientation %s° (not sideways-looking, skipped scoring)", pn + 1, orient_label)
+            else:
+                logger.info("Page %d: orientation %s° (score=%.2f)", pn + 1, orient_label, orient_score)
+        _mark("page_orientation")
+
         w, h = img.size
 
         if debug_dir:
@@ -113,7 +141,10 @@ class DocumentPipeline:
         raw_blocks = self.layout.detect(img, cfg.layout_threshold)
         _mark("layout_detect")
         page_crop_debug_dir = os.path.join(debug_dir, f"page_{pn + 1}_vietocr_crops") if debug_dir else None
-        ocr_boxes = run_ocr_page(img, self.ocr, crop_debug_dir=page_crop_debug_dir)
+        ocr_boxes = run_ocr_page(
+            img, self.ocr, crop_debug_dir=page_crop_debug_dir,
+            dt_boxes=dt_boxes_reuse, prerecognized=prerecognized_reuse,
+        )
         _mark("ocr_page")
 
         if debug_dir:
@@ -133,16 +164,7 @@ class DocumentPipeline:
                 if debug_dir:
                     save_table_crop(crop, debug_dir, pn, tno)
                 tno += 1
-                tsr_result = self.tsr([crop], thr=cfg.tsr_threshold)
-                cpns = tsr_result[0] if tsr_result else []
-                crop_debug_dir = (
-                    os.path.join(debug_dir, f"page_{pn + 1}_table_{tno - 1}_vietocr_crops")
-                    if debug_dir else None
-                )
-                raw_ocr_crop = raw_ocr(crop, self.ocr, crop_debug_dir=crop_debug_dir)
-                if debug_dir:
-                    save_table_ocr_debug(crop, raw_ocr_crop, debug_dir, pn, tno - 1)
-                content = table_to_markdown(crop, cpns, self.ocr, raw=raw_ocr_crop)
+                content = self.table_processor(crop, debug_dir=debug_dir, pn=pn, tno=tno - 1)
                 blocks.append({**b, "content_type": "table", "content": content})
             elif btype in label_schema.skip_types:
                 blocks.append({**b, "content_type": "skip", "content": None})
@@ -220,9 +242,10 @@ def build_pipeline(conf: dict | None = None) -> DocumentPipeline:
     duplicated business logic between the two entry points."""
     conf = conf or load_pipeline_conf()
     config = PipelineConfig.from_conf(conf)
+    ocr = get_ocr_engine(conf)
     return DocumentPipeline(
         get_layout_backend(conf),
-        get_ocr_engine(conf),
-        get_tsr_backend(conf),
+        ocr,
+        get_table_processor(conf, ocr),
         config,
     )

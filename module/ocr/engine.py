@@ -273,9 +273,30 @@ class TextDetector:
         return dt_boxes, time.time() - st
 
 
+def _build_mineru_text_detector(device: str):
+    """Builds MinerU's own PP-OCRv6 text detector (same DB/DBNet algorithm family
+    as the onnx TextDetector above, different trained checkpoint) -- lazy import so
+    installs that never select ocr.det_backend: mineru don't need `mineru`."""
+    from mineru.model.utils.tools.infer import pytorchocr_utility as utility
+    from mineru.model.utils.tools.infer.predict_det import TextDetector as MineruTextDetector
+    from mineru.utils.enum_class import ModelPath
+    from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
+
+    det_filename = "ch_PP-OCRv6_small_det_infer.safetensors"
+    det_rel = f"{ModelPath.pytorch_paddle}/{det_filename}"
+    det_path = os.path.join(auto_download_and_get_model_root_path(det_rel), det_rel)
+
+    parser = utility.init_args()
+    args = parser.parse_args([])
+    args.device = device
+    args.det_model_path = det_path
+
+    return MineruTextDetector(args)
+
+
 class OCR:
     def __init__(self, model_dir=None, vietocr_weight_path: str = None, vietocr_base_config: str = None,
-                 crop_pad_px_h: float = 3.0, crop_pad_px_w: float = 0.0):
+                 crop_pad_px_h: float = 3.0, crop_pad_px_w: float = 0.0, det_backend: str = "onnx"):
         """
         If you have trouble downloading HuggingFace models, -_^ this might help!!
 
@@ -293,17 +314,25 @@ class OCR:
 
         devices = list(range(PARALLEL_DEVICES)) if PARALLEL_DEVICES else [0]
 
-        # Only the DeepDoc ONNX detector depends on `model_dir` containing the
-        # right files -- fall back to downloading them from HuggingFace if
-        # missing. VietOCR weight resolution below is independent of this and
-        # must fail loudly (not get masked by this fallback) if misconfigured.
-        try:
-            self.text_detector = [TextDetector(model_dir, d) for d in devices]
-        except Exception:
-            model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
-                                          local_dir=os.path.join(get_project_base_directory(), "onnx"),
-                                          local_dir_use_symlinks=False)
-            self.text_detector = [TextDetector(model_dir, d) for d in devices]
+        if det_backend == "mineru":
+            self.text_detector = [
+                _build_mineru_text_detector(f"cuda:{d}" if torch.cuda.is_available() else "cpu")
+                for d in devices
+            ]
+        elif det_backend == "onnx":
+            # Only the DeepDoc ONNX detector depends on `model_dir` containing the
+            # right files -- fall back to downloading them from HuggingFace if
+            # missing. VietOCR weight resolution below is independent of this and
+            # must fail loudly (not get masked by this fallback) if misconfigured.
+            try:
+                self.text_detector = [TextDetector(model_dir, d) for d in devices]
+            except Exception:
+                model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
+                                              local_dir=os.path.join(get_project_base_directory(), "onnx"),
+                                              local_dir_use_symlinks=False)
+                self.text_detector = [TextDetector(model_dir, d) for d in devices]
+        else:
+            raise ValueError(f"Unknown ocr det_backend: {det_backend!r}")
 
         self.text_recognizer = [TextRecognizer(
             model_dir, d,

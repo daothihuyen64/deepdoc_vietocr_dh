@@ -84,6 +84,18 @@ def save_table_ocr_debug(crop: Image.Image, raw_ocr_crop: list, out_dir: str, pn
     canvas.save(os.path.join(out_dir, f"page_{pn + 1}_table_{tno}_ocr.png"))
 
 
+def save_table_backend_compare(mineru_content: str, tsr_content: str, out_dir: str, pn: int, tno: int) -> None:
+    """Dumps the mineru (wireless) vs tsr content for the SAME table crop
+    side by side, for manual quality comparison only -- never read back by
+    the pipeline itself."""
+    path = os.path.join(out_dir, f"page_{pn + 1}_table_{tno}_wireless_compare.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("## mineru (wireless)\n\n")
+        f.write(mineru_content + "\n\n")
+        f.write("## tsr\n\n")
+        f.write(tsr_content + "\n")
+
+
 def save_ocr_debug(img: Image.Image, ocr_boxes: list[OCRBox], out_dir: str, pn: int) -> None:
     """Draws every OCR bbox tagged with its index, plus a legend at the
     bottom of the image mapping each index to its recognized text."""

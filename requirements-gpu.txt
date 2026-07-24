@@ -16,3 +16,5 @@ uvicorn[standard]
 python-multipart
 paddleocr
 pdf2image
+mineru[pipeline]
+loguru
