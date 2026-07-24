@@ -64,7 +64,7 @@ class DocumentPipeline:
             with open(os.path.join(debug_dir, "output.md"), "w", encoding="utf-8") as f:
                 f.write(markdown)
 
-        out_dir = os.path.join(self.config.output_dir, Path(label).stem + "_v2_fix_xoay_anh_va_bang")
+        out_dir = os.path.join(self.config.output_dir, Path(label).stem)
         os.makedirs(out_dir, exist_ok=True)
         shutil.copyfile(pdf_path, os.path.join(out_dir, label if label.lower().endswith(".pdf") else f"{label}.pdf"))
         with open(os.path.join(out_dir, "output.json"), "w", encoding="utf-8") as f:
