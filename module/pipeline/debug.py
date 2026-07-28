@@ -48,12 +48,15 @@ def save_layout_debug(img: Image.Image, raw_blocks: list[LayoutBlock], out_dir: 
     canvas.save(os.path.join(out_dir, f"page_{pn + 1}_layout.png"))
 
 
-def save_table_crop(crop: Image.Image, out_dir: str, pn: int, tno: int) -> None:
-    """Saves a table crop as fed into TSR, after deskewing."""
-    crop.convert("RGB").save(os.path.join(out_dir, f"page_{pn + 1}_table_{tno}_deskewed.png"))
+def save_table_crop(crop: Image.Image, out_dir: str, pn: int, tno: int, suffix: str = "") -> None:
+    """Saves a table crop as fed into TSR, after deskewing. `suffix` (e.g.
+    "_wire"/"_wireless") is appended to the filename when the caller already
+    knows the wired-vs-wireless classification (mineru backend only -- tsr
+    has no such concept, so it never passes one)."""
+    crop.convert("RGB").save(os.path.join(out_dir, f"page_{pn + 1}_table_{tno}_deskewed{suffix}.png"))
 
 
-def save_table_ocr_debug(crop: Image.Image, raw_ocr_crop: list, out_dir: str, pn: int, tno: int) -> None:
+def save_table_ocr_debug(crop: Image.Image, raw_ocr_crop: list, out_dir: str, pn: int, tno: int, suffix: str = "") -> None:
     """Draws every OCR bbox detected inside a table crop (the same 'raw'
     result fed into table_to_markdown), tagged with its index, plus a
     legend at the bottom mapping each index to its recognized text -- for
@@ -81,7 +84,7 @@ def save_table_ocr_debug(crop: Image.Image, raw_ocr_crop: list, out_dir: str, pn
         draw.text((5, y), f"{i}: {text}", fill=(0, 0, 0), font=font)
         y += _LEGEND_LINE_HEIGHT
 
-    canvas.save(os.path.join(out_dir, f"page_{pn + 1}_table_{tno}_ocr.png"))
+    canvas.save(os.path.join(out_dir, f"page_{pn + 1}_table_{tno}_ocr{suffix}.png"))
 
 
 def save_table_backend_compare(mineru_content: str, tsr_content: str, out_dir: str, pn: int, tno: int) -> None:

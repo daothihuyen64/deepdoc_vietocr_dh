@@ -20,14 +20,6 @@ def get_table_processor(conf: dict, ocr: OCREngine) -> TableProcessor:
         )
     if backend == "mineru":
         from .mineru_processor import MinerUTableProcessor
-        tsr_threshold = conf.get("tsr", {}).get("threshold", 0.2)
-        # Only load the TSR model when debug output is on -- it's used
-        # exclusively as a manual side-by-side comparison for wireless
-        # tables (see MinerUTableProcessor), never for the real result, so
-        # a production run with debug off shouldn't pay to load it at all.
-        if conf.get("debug", {}).get("enabled", False):
-            from ..tsr import get_tsr_backend
-            return MinerUTableProcessor(ocr, tsr=get_tsr_backend(conf), tsr_threshold=tsr_threshold)
         return MinerUTableProcessor(ocr)
     raise ValueError(f"Unknown table backend: {backend!r}")
 

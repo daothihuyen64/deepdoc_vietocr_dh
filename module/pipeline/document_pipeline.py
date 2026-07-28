@@ -127,10 +127,7 @@ class DocumentPipeline:
                 sideways_min_count=cfg.page_orientation_sideways_min_count,
                 sideways_min_ratio=cfg.page_orientation_sideways_min_ratio,
             )
-            if orient_score is None:
-                logger.info("Page %d: orientation %s° (not sideways-looking, skipped scoring)", pn + 1, orient_label)
-            else:
-                logger.info("Page %d: orientation %s° (score=%.2f)", pn + 1, orient_label, orient_score)
+            logger.info("Page %d: orientation %s° (score=%.2f)", pn + 1, orient_label, orient_score)
         _mark("page_orientation")
 
         w, h = img.size
@@ -161,10 +158,15 @@ class DocumentPipeline:
                 crop, skew_angle = deskew_crop(crop)
                 if abs(skew_angle) > 0.1:
                     logger.debug("Page %d: table deskewed by %.2f°", pn + 1, skew_angle)
-                if debug_dir:
-                    save_table_crop(crop, debug_dir, pn, tno)
                 tno += 1
                 content = self.table_processor(crop, debug_dir=debug_dir, pn=pn, tno=tno - 1)
+                if debug_dir:
+                    # last_table_kind ("wire"/"wireless") is only set by the
+                    # mineru backend (see MinerUTableProcessor) after it has
+                    # classified this crop -- the tsr backend has no such
+                    # concept, so getattr falls back to no suffix for it.
+                    kind = getattr(self.table_processor, "last_table_kind", None)
+                    save_table_crop(crop, debug_dir, pn, tno - 1, suffix=f"_{kind}" if kind else "")
                 blocks.append({**b, "content_type": "table", "content": content})
             elif btype in label_schema.skip_types:
                 blocks.append({**b, "content_type": "skip", "content": None})

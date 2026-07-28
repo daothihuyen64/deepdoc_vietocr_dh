@@ -5,9 +5,8 @@ import numpy as np
 from PIL import Image
 
 from ..ocr import OCREngine
-from ..pipeline.debug import save_table_backend_compare, save_table_ocr_debug
-from ..pipeline.table import table_to_markdown
-from ..tsr import TSRBackend
+from ..pipeline.debug import save_table_ocr_debug
+from .surya_wireless import SuryaWirelessTableProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -20,53 +19,72 @@ _unet._cell_text = lambda m, i: " ".join(m.get(i, []))
 
 
 class MinerUTableProcessor:
-    """Table backend built on MinerU's model stack: orientation fix ->
-    wired/wireless classify -> OCR -> table-structure model (SLANet-Plus
-    wireless, always; UNet wired, for wired tables -- internally compares
-    both and keeps whichever HTML has better cell/text coverage) -> HTML.
+    """Table backend: orientation fix -> wired/wireless classify -> OCR ->
+    table-structure model -> HTML.
 
-    Detection AND recognition reuse the shared `OCREngine` entirely --
-    `ocr.text_detector[0]` (whatever `ocr.det_backend` resolves to: the onnx
-    detector by default, or MinerU's own PP-OCRv6 if configured) and
-    `ocr.text_recognizer[0].detector` (the VietOCR predictor module/ocr
-    already loaded, same weight file) -- instead of loading a second VietOCR
-    copy, so table detection always stays consistent with whatever detector
-    page-level OCR is using. Only the table-structure/orientation/
-    wired-vs-wireless models are unconditionally MinerU's own.
+    Wireless (`SuryaWirelessTableProcessor`, see surya_wireless.py) ALWAYS
+    runs -- it's the baseline/fallback candidate for every table regardless
+    of classification. When classified wired, the wired (UNet) model ALSO
+    runs, via MinerU's own `UnetTableModel.predict()` wrapper -- which
+    internally re-runs `wired_table_model()` itself, then applies MinerU's
+    hard-coded cell-count/text-match/blank-cell heuristic
+    (`mineru/model/table/rec/unet_table/main.py:283-370`) comparing the
+    wired result against the wireless HTML we hand it, falling back to
+    wireless when wired looks clearly worse (too few cells, too little
+    matched OCR text, etc). This restores MinerU's original auto-compare
+    design (which this file's strict-either/or dispatch had replaced) --
+    with Surya swapped in for MinerU's own SLANet-Plus as the wireless
+    candidate everywhere that heuristic reads "wireless".
+
+    Wired-vs-wireless classification uses RapidAI's `table_cls` (QAnything
+    classifier, `model_type="q"`, `pip install table_cls`) instead of
+    MinerU's own `TableCls` atom model -- swapped per user testing. Unlike
+    MinerU's classifier, this one returns only a label ("wired"/"wireless"),
+    no confidence score, so there's no low-confidence-falls-back-to-wired
+    heuristic anymore.
+
+    For the WIRED path, detection AND recognition reuse the shared
+    `OCREngine` entirely -- `ocr.text_detector[0]` (whatever
+    `ocr.det_backend` resolves to: the onnx detector by default, or
+    MinerU's own PP-OCRv6 if configured) and `ocr.text_recognizer[0].detector`
+    (the VietOCR predictor module/ocr already loaded, same weight file) --
+    instead of loading a second VietOCR copy.
+
+    The WIRELESS path (`SuryaWirelessTableProcessor`) is the one deliberate
+    exception: per explicit user request it uses Surya's OWN
+    `DetectionPredictor` for bbox detection (mirroring
+    surya_v1_table_to_html_vietocr.ipynb exactly), NOT the shared detector --
+    only recognition there still reuses the shared VietOCR predictor.
 
     All `mineru` imports needed JUST for this table backend are lazy (inside
     methods, not at module import time) so `module.table` stays importable
     -- and the "tsr" table backend still works -- on installs that don't
     have `mineru` and never select `table.backend: mineru` (independent of
     whatever `ocr.det_backend` is set to).
-
-    `tsr`, when given, is used ONLY as a side-by-side comparison for manual
-    quality review -- run and dumped to debug_dir alongside the real
-    (mineru) result whenever a table comes back wireless, never fed into
-    the returned content. `get_table_processor()` only constructs one when
-    debug is enabled, so production runs don't pay for a TSR model they
-    never look at.
     """
 
-    def __init__(self, ocr: OCREngine, tsr: TSRBackend | None = None, tsr_threshold: float = 0.2):
+    def __init__(self, ocr: OCREngine):
         from mineru.backend.pipeline.model_init import AtomModelSingleton
 
         self._ocr = ocr
         self._text_det = ocr.text_detector[0]
         self._vietocr = ocr.text_recognizer[0].detector
-        self._tsr = tsr
-        self._tsr_threshold = tsr_threshold
         self._atom = AtomModelSingleton()
+        # Set by __call__ once TableCls has run -- "wire" or "wireless".
+        # Read by document_pipeline.py (via getattr, since only this backend
+        # has the concept) to suffix the deskewed-crop debug filename.
+        self.last_table_kind: str | None = None
         self._load_table_models()
 
     def _load_table_models(self) -> None:
         from mineru.backend.pipeline.model_list import AtomicModel
+        from table_cls import TableCls
 
         self._AtomicModel = AtomicModel
         self._ori_cls = self._atom.get_atom_model(atom_model_name=AtomicModel.TableOrientationCls)
-        self._table_cls = self._atom.get_atom_model(atom_model_name=AtomicModel.TableCls)
-        self._wireless = self._atom.get_atom_model(atom_model_name=AtomicModel.WirelessTable, lang=None)
+        self._table_cls = TableCls(model_type="q")  # RapidAI QAnything wired/wireless classifier
         self._wired = self._atom.get_atom_model(atom_model_name=AtomicModel.WiredTable, lang=None)
+        self._surya = SuryaWirelessTableProcessor(self._vietocr)
 
     @staticmethod
     def _to_rgb(image) -> np.ndarray:
@@ -131,8 +149,13 @@ class MinerUTableProcessor:
 
     def _is_wired(self, img: np.ndarray) -> bool:
         """Return True when the table has visible grid lines (wired table)."""
-        label, score = self._table_cls.predict(img)
-        return label == self._AtomicModel.WiredTable or score < 0.9
+        import cv2
+
+        # table_cls's LoadImage leaves a raw ndarray untouched (assumes it's
+        # already BGR, cv2's native order) -- our img is RGB.
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        label, _elapse = self._table_cls(bgr)
+        return label == "wired"
 
     @staticmethod
     def _trim_to_table_tag(raw: str | None) -> str:
@@ -156,54 +179,39 @@ class MinerUTableProcessor:
         img = self._fix_orientation(img)
 
         is_wired = self._is_wired(img)
-        logger.info("Page %d table %d: classified as %s", pn + 1, tno, "wired" if is_wired else "wireless")
+        self.last_table_kind = "wire" if is_wired else "wireless"
+        logger.info("Page %d table %d: classified as %s", pn + 1, tno, self.last_table_kind)
 
-        ocr_result = self._run_ocr(img)
+        # Wireless (Surya) always runs -- baseline for every table, and the
+        # fallback candidate MinerU's own compare heuristic below can pick
+        # instead of wired.
+        wireless_html = self._surya(img)
+
+        if is_wired:
+            # Shared detector -- feeds the wired model's own recognition AND
+            # is what UnetTableModel.predict()'s heuristic below counts
+            # matched-text against for both candidates.
+            ocr_result = self._run_ocr(img)
+            if ocr_result:
+                result = self._wired.predict(img, ocr_result, wireless_html, return_metadata=True)
+                final_html = result["html"]
+                logger.info(
+                    "Page %d table %d: wired-vs-wireless compare -> selected %s",
+                    pn + 1, tno, result["selected_model"],
+                )
+            else:
+                final_html = wireless_html
+        else:
+            ocr_result = self._surya.last_ocr_result
+            final_html = wireless_html
+
         logger.debug("OCR found %d text boxes", len(ocr_result))
         if debug_dir:
             save_table_ocr_debug(
                 Image.fromarray(img),
                 [(box, (text, score)) for box, text, score in ocr_result],
                 debug_dir, pn, tno,
+                suffix=f"_{self.last_table_kind}",
             )
 
-        # Wireless model always runs (baseline). Wired model runs only for
-        # wired tables and internally picks whichever HTML is better.
-        wireless_html, *_ = self._wireless.predict(img, ocr_result or None)
-        if is_wired and ocr_result:
-            final_html = self._wired.predict(img, ocr_result, wireless_html)
-        else:
-            final_html = wireless_html
-            if debug_dir and self._tsr is not None:
-                logger.info("Page %d table %d: wireless -> writing tsr comparison", pn + 1, tno)
-                try:
-                    self._save_tsr_compare(img, ocr_result, wireless_html, debug_dir, pn, tno)
-                except Exception:
-                    # This is a side, manual-comparison-only debug aid (see
-                    # class docstring) -- it must NEVER take down the real
-                    # request/result just because the "tsr" backend it
-                    # borrows for comparison hit an unrelated problem.
-                    logger.exception("Page %d table %d: tsr comparison failed, skipping it", pn + 1, tno)
-            elif debug_dir:
-                logger.info("Page %d table %d: wireless but no tsr backend loaded (debug was off at startup?) -- skipping comparison", pn + 1, tno)
-
         return self._trim_to_table_tag(final_html or wireless_html)
-
-    def _save_tsr_compare(
-        self,
-        img: np.ndarray,
-        ocr_result: list,
-        mineru_html: str,
-        debug_dir: str,
-        pn: int,
-        tno: int,
-    ) -> None:
-        """Runs the "tsr" backend on the SAME crop + OCR result that just
-        went through mineru's wireless model, purely so the two outputs can
-        be eyeballed side by side -- never used for the real block content."""
-        crop_img = Image.fromarray(img)
-        tsr_result = self._tsr([crop_img], thr=self._tsr_threshold)
-        cpns = tsr_result[0] if tsr_result else []
-        raw = [(box, (text, score)) for box, text, score in ocr_result]
-        tsr_content = table_to_markdown(crop_img, cpns, self._ocr, raw=raw)
-        save_table_backend_compare(mineru_html or "", tsr_content, debug_dir, pn, tno)

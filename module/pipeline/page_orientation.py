@@ -147,36 +147,51 @@ def correct_page_orientation(
     min_scores: int = 5,
     sideways_min_count: int = 4,
     sideways_min_ratio: float = 0.3,
-) -> tuple[Image.Image, str, float | None, np.ndarray | None, dict[int, tuple[str, float]]]:
-    """Detects 0 deg's boxes first -- detection ONLY, no recognition yet. If
-    they don't geometrically look plausibly sideways (see `_looks_sideways`
-    -- more than `sideways_min_count` AND more than `sideways_min_ratio` of
-    them taller than wide), returns 0 immediately WITHOUT ever recognizing/
-    scoring/rotating anything: geometry alone can't tell 90 from 270 (needs
-    real content), but it CAN cheaply rule out "obviously not rotated at
-    all" from the boxes it already has -- no need to spend an OCR pass just
-    to produce a score nothing will compare against. `run_ocr_page()` still
-    reuses this detection either way; it just recognizes the full page in
-    one batched pass instead of a sample now + the remainder later.
+) -> tuple[Image.Image, str, float, np.ndarray | None, dict[int, tuple[str, float]]]:
+    """Detects 0 deg's boxes first -- detection ONLY, no recognition yet.
 
-    Only once that gate passes does 0 get sample-recognized (real score) and
-    the OCR-confidence early-exit run: 90 deg -- stop immediately if it
-    clears `score_threshold` -- otherwise 270 deg (always the last
-    candidate), then take whichever of the (up to) 3 scores tried is
-    highest.
+    If they don't geometrically look plausibly sideways (see
+    `_looks_sideways` -- more than `sideways_min_count` AND more than
+    `sideways_min_ratio` of them taller than wide), 90/270 are ruled out
+    without ever recognizing/rotating for them -- geometry alone can't tell
+    90 from 270 (needs real content), but it CAN cheaply rule out "rotated a
+    quarter turn" from box shapes alone. 180 is a different story: a page
+    rotated 180 degrees still has ordinary wide-not-tall text-line boxes
+    (rotating 180 doesn't change a box's aspect ratio, only which way the
+    characters inside it face), so this geometry gate can never catch it --
+    0 always gets sample-recognized for real here, and 180 gets tried too
+    whenever 0 doesn't read confidently, comparing the two scores to pick
+    a winner.
 
-    Returns (final_img, label, score, dt_boxes, recognized) -- `score` is
-    `None` when the gate above short-circuited (0 was never actually
-    scored). `dt_boxes`/`recognized` are the WINNING candidate's already-
-    computed detection (all boxes) and recognition (sampled subset, empty
-    when short-circuited) -- reusable by run_ocr_page() instead of redoing
-    that work on the image this function hands back.
+    When the gate DOES trip (looks plausibly quarter-turned), 0 gets
+    sample-recognized (real score) and the OCR-confidence early-exit run:
+    90 deg -- stop immediately if it clears `score_threshold` -- otherwise
+    270 deg (always the last candidate), then take whichever of the (up to)
+    3 scores tried is highest. 180 is not tried on this path -- a page
+    that's genuinely quarter-turned is not also upside down.
+
+    Returns (final_img, label, score, dt_boxes, recognized) -- `dt_boxes`/
+    `recognized` are the WINNING candidate's already-computed detection
+    (all boxes) and recognition (sampled subset) -- reusable by
+    run_ocr_page() instead of redoing that work on the image this function
+    hands back.
     """
     img_bgr_0 = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
     dt_boxes_0 = _detect_boxes(img_bgr_0, ocr)
 
     if not _looks_sideways(dt_boxes_0, sideways_min_count, sideways_min_ratio):
-        return img, "0", None, dt_boxes_0, {}
+        score_0, recognized_0 = _sample_recognize(img_bgr_0, dt_boxes_0, ocr, sample_max, min_scores)
+        if score_0 > score_threshold:
+            return img, "0", score_0, dt_boxes_0, recognized_0
+
+        img_bgr_180 = cv2.rotate(img_bgr_0, cv2.ROTATE_180)
+        score_180, dt_boxes_180, recognized_180 = _score_orientation_candidate(
+            img_bgr_180, ocr, sample_max, min_scores
+        )
+        if score_180 > score_0:
+            final_img = Image.fromarray(cv2.cvtColor(img_bgr_180, cv2.COLOR_BGR2RGB))
+            return final_img, "180", score_180, dt_boxes_180, recognized_180
+        return img, "0", score_0, dt_boxes_0, recognized_0
 
     score_0, recognized_0 = _sample_recognize(img_bgr_0, dt_boxes_0, ocr, sample_max, min_scores)
     best_score, best_label = score_0, "0"

@@ -1,8 +1,8 @@
 numpy
 opencv-python
 onnxruntime
-torch
-torchvision
+torch==2.13.0
+torchvision==0.28.0
 einops
 matplotlib
 Pillow
@@ -21,3 +21,8 @@ paddleocr
 pdf2image
 mineru[pipeline]
 loguru
+table_cls==1.2.0
+# surya-ocr is NOT listed here -- its own `pillow<11.0.0` pin conflicts with
+# mineru[pipeline]'s `pillow>=11.0.0` (no overlapping version satisfies
+# both), so pip can't resolve them together in one -r pass. It's installed
+# separately with --no-deps right after this file in the Dockerfile.
