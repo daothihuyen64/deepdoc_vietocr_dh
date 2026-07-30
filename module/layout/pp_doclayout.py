@@ -38,6 +38,7 @@ class PPDocLayoutBackend:
         from paddleocr import LayoutDetection
         self._model = LayoutDetection(model_name=model_name, device=device)
         logger.info("[device] Layout (%s): device=%s", model_name, device)
+        self._device = device
         # Caps how many images PaddleX actually stacks into one forward
         # pass at a time -- `predict()`'s own `batch_size` arg handles this
         # internally (still returns one result per input image, in order,
@@ -107,6 +108,35 @@ class PPDocLayoutBackend:
             for tmp_path in tmp_paths:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+
+        # PaddlePaddle's own GPU allocator, like PyTorch's, holds freed
+        # memory reserved for reuse within this SAME process instead of
+        # returning it to the driver -- fine on its own, but this project
+        # also runs PyTorch models (VietOCR, mineru's OCR detector, Surya)
+        # in the SAME process/GPU, with their OWN separate allocator that
+        # can't reclaim memory Paddle is still holding. A big batch here
+        # (many same-shaped pages at once) can leave Paddle holding
+        # several GB "reserved but unused" long after this call returns,
+        # starving a later PyTorch call (e.g. Surya's table detection)
+        # even on a small GPU that would otherwise have had room -- see
+        # the equivalent torch.cuda.empty_cache() call in
+        # vietocr/tool/predictor.py's predict_batch() for the mirror-image
+        # problem (torch starving Paddle) this was found alongside.
+        if self._device.startswith("gpu"):
+            import paddle
+            # Temporary diagnostic instrumentation (mirrors the equivalent
+            # torch before/after log in vietocr/tool/predictor.py's
+            # predict_batch()) -- confirms on a live server whether Paddle
+            # really was holding a large chunk of "reserved but unused" GPU
+            # memory before deciding this fix is enough on its own.
+            before_allocated = paddle.device.cuda.memory_allocated() / 1024**2
+            before_reserved = paddle.device.cuda.memory_reserved() / 1024**2
+            paddle.device.cuda.empty_cache()
+            after_reserved = paddle.device.cuda.memory_reserved() / 1024**2
+            logger.info(
+                "[gpu-mem] Layout predict(%d imgs): allocated=%.0fMB reserved=%.0fMB -> %.0fMB after empty_cache()",
+                len(images), before_allocated, before_reserved, after_reserved,
+            )
 
         if len(paddle_results) != len(images):
             raise RuntimeError(
