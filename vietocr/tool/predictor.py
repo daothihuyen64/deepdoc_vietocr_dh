@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from vietocr.tool.translate import build_model, process_input_batch, translate
@@ -57,4 +59,30 @@ class Predictor:
         for i in range(len(imgs)):
             text = self.vocab.decode(sent[i].tolist())
             results.append((text, float(prob[i])))
+
+        # PyTorch's CUDA caching allocator does NOT release freed memory
+        # back to the driver by default -- it keeps it reserved for reuse
+        # by ANOTHER torch call later in this SAME process. That's fine
+        # when only torch models share the GPU, but this project also runs
+        # PaddlePaddle (layout) on the same GPU/process, with its OWN
+        # separate allocator that can't touch memory torch is still
+        # holding onto -- a large predict_batch() call here (e.g.
+        # page-orientation scoring batching many pages' samples together)
+        # can leave torch holding several GB "reserved but unused" long
+        # after this call returns, silently starving PaddleX's later
+        # layout batch call even though the actual tensors were freed.
+        # empty_cache() hands that reserved-but-unused memory back to the
+        # shared CUDA pool. The before/after log line is temporary
+        # diagnostic instrumentation to confirm this is really what's
+        # happening on a live server before deciding this fix is enough.
+        if torch.cuda.is_available():
+            before_allocated = torch.cuda.memory_allocated() / 1024**2
+            before_reserved = torch.cuda.memory_reserved() / 1024**2
+            torch.cuda.empty_cache()
+            after_reserved = torch.cuda.memory_reserved() / 1024**2
+            logging.info(
+                "[gpu-mem] VietOCR predict_batch(%d crops): allocated=%.0fMB reserved=%.0fMB -> %.0fMB after empty_cache()",
+                len(imgs), before_allocated, before_reserved, after_reserved,
+            )
+
         return results
