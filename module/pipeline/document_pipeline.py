@@ -17,7 +17,7 @@ from .config import PipelineConfig, load_pipeline_conf
 from .content import build_block_content, build_json, build_markdown
 from .debug import save_input_image, save_layout_debug, save_ocr_debug, save_table_crop
 from .loader import load_pdf_pages
-from .ocr_page import run_ocr_page
+from .ocr_page import PageOcrPrep, finish_ocr_page, prepare_ocr_page
 from .page_orientation import correct_page_orientation, deskew_page
 from .reading_order import sort_reading_order, tb_rows
 from .table import deskew_crop
@@ -185,10 +185,64 @@ class DocumentPipeline:
                 if debug_dir:
                     save_table_crop(crop, debug_dir, pn, tno, suffix=f"_{kind}" if kind else "")
 
-        # Phase 3: per-page OCR + reading-order/content assembly, now that
-        # every page's blocks (including table content) are already built.
+        # Phase 3a: per-page OCR detection + cropping (cheap, no VietOCR
+        # call yet) -- collects every page's not-yet-recognized crops into
+        # ONE flat list spanning the WHOLE document, mirroring table
+        # content's Phase 2.5/2.6 pattern, so VietOCR recognizes them all
+        # in as few batched forward passes as possible instead of once per
+        # page.
+        t_ocr_prep = time.time()
+        ocr_preps: list[PageOcrPrep] = []
+        all_ocr_crops: list[np.ndarray] = []
+        # Which page each all_ocr_crops[i] belongs to -- built in the SAME
+        # per-page order crops are appended below, so it can be zipped
+        # back against the recognition output 1:1 with no risk of a page's
+        # text ending up assigned to a different page.
+        crop_owner_pn: list[int] = []
+        for pn in range(len(pages)):
+            page_crop_debug_dir = os.path.join(debug_dir, f"page_{pn + 1}_vietocr_crops") if debug_dir else None
+            prep, crops = prepare_ocr_page(
+                prepped[pn].img, self.ocr, crop_debug_dir=page_crop_debug_dir,
+                dt_boxes=prepped[pn].dt_boxes_reuse, prerecognized=prepped[pn].prerecognized_reuse,
+            )
+            ocr_preps.append(prep)
+            all_ocr_crops.extend(crops)
+            crop_owner_pn.extend([pn] * len(crops))
+        logger.info(
+            "Prepared OCR boxes for %d pages (%d crop(s) need fresh recognition) in %.2fs",
+            len(pages), len(all_ocr_crops), time.time() - t_ocr_prep,
+        )
+
+        # Phase 3b: recognize EVERY crop across the WHOLE document in ONE
+        # VietOCR call -- TextRecognizer.__call__ still chunks internally
+        # by ocr.vietocr_max_batch_size (see module/ocr/engine.py), so this
+        # stays memory-bounded even for a huge multi-page document.
+        t_ocr_rec = time.time()
+        fresh_rec_res_all, _ = self.ocr.text_recognizer[0](all_ocr_crops) if all_ocr_crops else ([], 0.0)
+        logger.info(
+            "Recognized %d text crop(s) (batched across whole document) in %.2fs",
+            len(all_ocr_crops), time.time() - t_ocr_rec,
+        )
+
+        # Slot each page's OWN slice of the whole-document recognition
+        # results back to it -- crop_owner_pn[i]/fresh_rec_res_all[i] are
+        # the SAME index into the SAME flat list built above (order is
+        # preserved end-to-end through TextRecognizer.__call__), so this
+        # grouping can't mix up which recognized text belongs to which page.
+        fresh_rec_res_by_page: list[list] = [[] for _ in pages]
+        for pn, res in zip(crop_owner_pn, fresh_rec_res_all):
+            fresh_rec_res_by_page[pn].append(res)
+
+        pages_ocr_boxes = [
+            finish_ocr_page(ocr_preps[pn], fresh_rec_res_by_page[pn], self.ocr)
+            for pn in range(len(pages))
+        ]
+
+        # Phase 3c: per-page reading-order/content assembly, now that every
+        # page's blocks (table content) and ocr_boxes (recognized text) are
+        # already built.
         pages_blocks = [
-            self._process_page_after_layout(pn, prepped[pn], page_blocks[pn], debug_dir)
+            self._process_page_after_layout(pn, prepped[pn], page_blocks[pn], pages_ocr_boxes[pn], debug_dir)
             for pn in range(len(pages))
         ]
 
@@ -353,12 +407,15 @@ class DocumentPipeline:
         pn: int,
         prepped: _PreparedPage,
         blocks: list[PageBlock],
+        ocr_boxes: list,
         debug_dir: str | None = None,
     ) -> list[PageBlock]:
-        """OCR + reading-order/content assembly for one page. `blocks`
-        (from process_pdf()'s Phase 2.5/2.6) already has table content
-        filled in -- table processing itself isn't done here anymore, so
-        it could be batched across the whole document beforehand."""
+        """Reading-order/content assembly for one page. `blocks` (from
+        process_pdf()'s Phase 2.5/2.6) already has table content filled
+        in, and `ocr_boxes` (from process_pdf()'s Phase 3a/3b) already has
+        every text box detected+recognized -- both batched across the
+        WHOLE document beforehand, so nothing in this method calls a
+        model anymore."""
         cfg = self.config
         label_schema = self.layout.label_schema
         img = prepped.img
@@ -373,18 +430,11 @@ class DocumentPipeline:
             timings[name] = now - t_stage
             t_stage = now
 
-        page_crop_debug_dir = os.path.join(debug_dir, f"page_{pn + 1}_vietocr_crops") if debug_dir else None
-        ocr_boxes = run_ocr_page(
-            img, self.ocr, crop_debug_dir=page_crop_debug_dir,
-            dt_boxes=prepped.dt_boxes_reuse, prerecognized=prepped.prerecognized_reuse,
-        )
-        _mark("ocr_page")
-
         if debug_dir:
             # save_layout_debug() already ran for every page right after
             # the Phase 2 batch call, in process_pdf() -- not repeated here.
             save_ocr_debug(img, ocr_boxes, debug_dir, pn)
-        _mark("tables")
+        _mark("ocr_debug_save")
 
         blocks = dedup_nested_blocks(blocks)
         unmatched = map_text_to_blocks(ocr_boxes, blocks, label_schema.skip_types, cfg.map_overlap_threshold)

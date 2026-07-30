@@ -1,6 +1,7 @@
 import copy
 import math
 import os
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -10,19 +11,79 @@ from ..ocr import OCREngine
 from .types import OCRBox
 
 
-def run_ocr_page(
+@dataclass
+class PageOcrPrep:
+    """Per-page detection state, held between prepare_ocr_page() (detect +
+    crop, no VietOCR call) and finish_ocr_page() (assembles the final
+    OCRBox list) -- split apart so process_pdf() can recognize every
+    page's crops in ONE VietOCR call spanning the WHOLE document, instead
+    of one call per page (see DocumentPipeline.process_pdf()'s Phase 3a/3b).
+    """
+
+    dt_boxes: np.ndarray | None
+    prerecognized: dict[int, tuple[str, float]] = field(default_factory=dict)
+    # Which positions in dt_boxes still need FRESH recognition (i.e. were
+    # NOT already in `prerecognized`) -- same order as the crops this page
+    # contributed to process_pdf()'s whole-document crop list, so
+    # finish_ocr_page() can zip them back together 1:1.
+    crop_indices: list[int] = field(default_factory=list)
+
+
+def prepare_ocr_page(
     img_pil: Image.Image,
     ocr: OCREngine,
     crop_debug_dir: str | None = None,
     dt_boxes: np.ndarray | None = None,
     prerecognized: dict[int, tuple[str, float]] | None = None,
-) -> list[OCRBox]:
-    """Runs detection + recognition ONCE for the whole page.
+) -> tuple[PageOcrPrep, list[np.ndarray]]:
+    """Detects (or reuses) this page's boxes and crops every box that still
+    needs fresh recognition -- does NOT call the recognizer itself.
 
     `dt_boxes`/`prerecognized`, when given, come from page_orientation.py having
     already detected (and, for a sampled subset, recognized) boxes on this EXACT
     image while scoring 0/90/270 candidates -- skips re-running the detector
     entirely, and only recognizes whichever boxes weren't in that sample.
+
+    Returns (prep, crops) -- crops is a flat list of the boxes needing
+    fresh recognition (same order as prep.crop_indices). Pass `crops` into
+    process_pdf()'s whole-document crop list, and pass `prep` + that
+    page's slice of the resulting recognition output into finish_ocr_page().
+    """
+    img_bgr = cv2.cvtColor(np.array(img_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+    ori_im = img_bgr.copy()
+
+    if dt_boxes is None:
+        dt_boxes = ocr.detect_sorted(img_bgr)
+
+    prerecognized = prerecognized or {}
+    crop_indices: list[int] = []
+    crops: list[np.ndarray] = []
+    has_boxes = dt_boxes is not None and len(dt_boxes) > 0
+    if has_boxes:
+        for bno in range(len(dt_boxes)):
+            if bno in prerecognized:
+                continue
+            tmp_box = copy.deepcopy(dt_boxes[bno])
+            crops.append(ocr.get_rotate_crop_image(ori_im, tmp_box))
+            crop_indices.append(bno)
+
+        # Dumps the EXACT crops that need fresh recognition (post crop
+        # padding/rotate-90 decision) -- for debugging what VietOCR
+        # actually sees per box, not a reconstruction of it. Boxes reused
+        # from page_orientation.py's sample aren't re-cropped, so they
+        # won't appear here.
+        if crop_debug_dir:
+            os.makedirs(crop_debug_dir, exist_ok=True)
+            for bno, img_crop in zip(crop_indices, crops):
+                cv2.imwrite(os.path.join(crop_debug_dir, f"{bno}.png"), img_crop)
+
+    return PageOcrPrep(dt_boxes=dt_boxes, prerecognized=prerecognized, crop_indices=crop_indices), crops
+
+
+def finish_ocr_page(prep: PageOcrPrep, fresh_rec_res: list[tuple[str, float]], ocr: OCREngine) -> list[OCRBox]:
+    """Assembles the final OCRBox list for one page, given this page's own
+    slice of recognition results (`fresh_rec_res`, in the SAME ORDER as
+    prep.crop_indices -- see prepare_ocr_page).
 
     Returns ocr_boxes with 'bbox' (raw), 'bbox_row' (virtual bbox counter-
     rotated by the page's estimated skew angle -- used as a row-grouping
@@ -30,41 +91,14 @@ def run_ocr_page(
     per-box local-anchor row grouping). The page image itself is never
     warped -- only these derived coordinates are.
     """
-    img_bgr = cv2.cvtColor(np.array(img_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
-    ori_im = img_bgr.copy()
-
-    if dt_boxes is None:
-        dt_boxes = ocr.detect_sorted(img_bgr)
-        if dt_boxes is None:
-            return []
-    elif len(dt_boxes) == 0:
+    dt_boxes = prep.dt_boxes
+    if dt_boxes is None or len(dt_boxes) == 0:
         return []
 
-    prerecognized = prerecognized or {}
-    img_crop_list = []
-    crop_indices = []
-    for bno in range(len(dt_boxes)):
-        if bno in prerecognized:
-            continue
-        tmp_box = copy.deepcopy(dt_boxes[bno])
-        img_crop_list.append(ocr.get_rotate_crop_image(ori_im, tmp_box))
-        crop_indices.append(bno)
-
-    # Dumps the EXACT crops handed to the recognizer below (post crop
-    # padding/rotate-90 decision) -- for debugging what VietOCR actually
-    # sees per box, not a reconstruction of it. Boxes reused from
-    # page_orientation.py's sample aren't re-cropped, so they won't appear here.
-    if crop_debug_dir:
-        os.makedirs(crop_debug_dir, exist_ok=True)
-        for bno, img_crop in zip(crop_indices, img_crop_list):
-            cv2.imwrite(os.path.join(crop_debug_dir, f"{bno}.png"), img_crop)
-
-    fresh_rec_res, _ = ocr.text_recognizer[0](img_crop_list) if img_crop_list else ([], 0.0)
-
     rec_res: list[tuple[str, float] | None] = [None] * len(dt_boxes)
-    for bno, res in prerecognized.items():
+    for bno, res in prep.prerecognized.items():
         rec_res[bno] = res
-    for bno, res in zip(crop_indices, fresh_rec_res):
+    for bno, res in zip(prep.crop_indices, fresh_rec_res):
         rec_res[bno] = res
 
     def _skew_of_quad(box, min_width=100):
@@ -120,3 +154,21 @@ def run_ocr_page(
             })
 
     return ocr_boxes
+
+
+def run_ocr_page(
+    img_pil: Image.Image,
+    ocr: OCREngine,
+    crop_debug_dir: str | None = None,
+    dt_boxes: np.ndarray | None = None,
+    prerecognized: dict[int, tuple[str, float]] | None = None,
+) -> list[OCRBox]:
+    """Runs detection + recognition ONCE for a single page -- convenience
+    wrapper over prepare_ocr_page()/finish_ocr_page() for callers that
+    don't need to batch recognition across multiple pages (e.g.
+    DocumentPipeline.process_pdf() calls the two halves directly instead,
+    to recognize every page's crops in one whole-document VietOCR call).
+    """
+    prep, crops = prepare_ocr_page(img_pil, ocr, crop_debug_dir, dt_boxes, prerecognized)
+    fresh_rec_res, _ = ocr.text_recognizer[0](crops) if crops else ([], 0.0)
+    return finish_ocr_page(prep, fresh_rec_res, ocr)
