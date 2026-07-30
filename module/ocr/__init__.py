@@ -11,6 +11,8 @@ def get_ocr_engine(conf: dict) -> OCR:
         crop_pad_px_h=ocr_conf.get("crop_pad_px_h", 3.0),
         crop_pad_px_w=ocr_conf.get("crop_pad_px_w", 0.0),
         det_backend=ocr_conf.get("det_backend", "onnx"),
+        det_max_batch_size=ocr_conf.get("max_batch_size", 8),
+        vietocr_max_batch_size=ocr_conf.get("vietocr_max_batch_size", 64),
     )
 
 

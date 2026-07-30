@@ -7,8 +7,14 @@ import math
 from PIL import Image
 
 
-def translate(img, model, max_seq_length=128, sos_token=1, eos_token=2):
+def translate(img, model, max_seq_length=128, sos_token=1, eos_token=2, src_lengths=None):
     """data: BxCxHxW
+
+    src_lengths: batch_size -- each image's true (unpadded) CNN-output
+        sequence length, only needed when `img` batches MULTIPLE
+        variable-width images padded to a common width (see
+        process_input_batch). None (default) matches the original
+        single-image/unpadded-batch behavior exactly.
 
     Returns:
         (translated_sentence, char_probs) -- translated_sentence: token ids
@@ -21,7 +27,7 @@ def translate(img, model, max_seq_length=128, sos_token=1, eos_token=2):
 
     with torch.no_grad():
         src = model.cnn(img)
-        memory = model.transformer.forward_encoder(src)
+        memory = model.transformer.forward_encoder(src, src_lengths)
 
         translated_sentence = [[sos_token] * len(img)]
         char_probs = [[1.0] * len(img)]
@@ -99,6 +105,57 @@ def process_input(image, image_height, image_min_width, image_max_width):
     img = img[np.newaxis, ...]
     img = torch.FloatTensor(img)
     return img
+
+
+def _cnn_output_length(pixel_width, pixel_height, cnn_ss):
+    """Replicates the CNN backbone's pooling stages (kernel == stride at
+    every stage -- non-overlapping pooling, see vietocr/model/backbone/vgg.py
+    and the vgg-seq2seq.yml config's cnn.ss/cnn.ks, which are always equal)
+    to compute the EXACT sequence length a single image of this pixel size
+    produces, with NO padding involved. `cnn_ss` is config['cnn']['ss'], a
+    list of [height_stride, width_stride] pairs, one per pooling stage.
+
+    This is what lets process_input_batch() tell the encoder/attention
+    exactly where each image's real content ends and its padding begins,
+    once multiple different-width images are stacked into one tensor.
+    """
+    w, h = pixel_width, pixel_height
+    for stride_h, stride_w in cnn_ss:
+        h = h // stride_h
+        w = w // stride_w
+    return max(w * h, 1)
+
+
+def process_input_batch(images, image_height, image_min_width, image_max_width, cnn_ss):
+    """Batched counterpart of process_input() -- resizes EACH image to its
+    own aspect-ratio-correct width exactly like process_input() does, then
+    right-pads every one (in pixel space, with zeros) out to the widest
+    image in this particular batch, so they can be stacked into one
+    (B, C, H, W) tensor for a single CNN + encoder forward pass.
+
+    Returns (batched_tensor, src_lengths): src_lengths[i] is image i's own
+    true (unpadded) CNN-output sequence length (see _cnn_output_length),
+    computed from its OWN resized width -- pass this straight through to
+    translate()'s src_lengths so the encoder/attention ignore the padded
+    tail instead of treating it as real image content.
+    """
+    resized = [
+        process_image(img, image_height, image_min_width, image_max_width)
+        for img in images
+    ]
+    widths = [arr.shape[2] for arr in resized]
+    max_w = max(widths)
+    channels = resized[0].shape[0]
+
+    batched = np.zeros((len(resized), channels, image_height, max_w), dtype=np.float32)
+    for i, arr in enumerate(resized):
+        batched[i, :, :, : arr.shape[2]] = arr
+
+    src_lengths = torch.LongTensor(
+        [_cnn_output_length(w, image_height, cnn_ss) for w in widths]
+    )
+
+    return torch.FloatTensor(batched), src_lengths
 
 
 

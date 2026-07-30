@@ -62,8 +62,21 @@ COPY . .
 # classifier weight, at build time so the container's first request doesn't
 # stall on a cold download (table_cls fetches its .onnx from modelscope.cn
 # on first use). model_type="q" must match module/table/mineru_processor.py.
-RUN python -c "from paddleocr import LayoutDetection; LayoutDetection(model_name='PP-DocLayout_plus-L')" \
-    && python -c "from table_cls import TableCls; TableCls(model_type='q')"
+# Retries a few times -- modelscope.cn downloads (table_cls's own, no retry
+# logic in that library) have been observed to drop mid-transfer on some
+# networks (IncompleteRead), which is a transient connectivity issue, not a
+# code bug -- both commands are safe to re-run (LayoutDetection/TableCls
+# resume/re-check already-downloaded files rather than re-fetching from
+# scratch).
+RUN success=0; \
+    for i in 1 2 3 4 5; do \
+        python -c "from paddleocr import LayoutDetection; LayoutDetection(model_name='PP-DocLayout_plus-L')" \
+        && python -c "from table_cls import TableCls; TableCls(model_type='q')" \
+        && { success=1; break; }; \
+        echo "Model pre-download attempt $i failed, retrying..."; \
+        sleep 5; \
+    done; \
+    [ "$success" = "1" ]
 
 EXPOSE 8000
 

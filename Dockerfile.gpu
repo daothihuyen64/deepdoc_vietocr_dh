@@ -24,20 +24,92 @@ WORKDIR /app
 
 COPY requirements-gpu.txt .
 # CUDA-enabled torch/torchvision and PaddlePaddle's own GPU build (PaddlePaddle
-# isn't on PyPI for GPU -- it has its own CUDA-matched package index) --
-# installed first, matching the base image's CUDA 12.6, so the later
-# `-r requirements-gpu.txt` pass sees them already satisfied and leaves them
-# alone. Bump the cu126 index/version here if the base image's CUDA version
-# above changes.
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu126 \
+# isn't on PyPI for GPU -- it has its own CUDA-matched package index), matching
+# the base image's CUDA 12.6.
+#
+# ORDER MATTERS, DO NOT REVERSE -- this mirrors the exact sequence verified
+# working manually on vast.ai (see vastai_gpu_deploy_TEST_deepdoc_vietocr_dh_test.txt
+# BUOC 6): paddlepaddle-gpu FIRST, then requirements-gpu.txt (which pulls in
+# mineru[pipeline]'s own transitive torch as a side effect), THEN torch/
+# torchvision pinned via --force-reinstall LAST so our exact verified pair
+# wins over whatever mineru's resolver picked -- pip resolves torch's own
+# required nvidia-*-cu12 sub-deps automatically as part of that final step,
+# same as the vast.ai manual run (which needed no separate nvidia-*-cu12
+# pinning pass at all and still worked). An earlier version of this
+# Dockerfile installed torch BEFORE paddle (the reverse order), which is what
+# made a manual nvidia-*-cu12 override pass necessary in the first place --
+# no longer needed now that the order matches the validated recipe.
+RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
-    && pip install --no-cache-dir -r requirements-gpu.txt
+    && pip install --no-cache-dir -r requirements-gpu.txt \
+    && pip install --no-cache-dir --force-reinstall torch==2.13.0 torchvision==0.28.0
+
+# surya-ocr==0.17.1 declares `pillow<11.0.0`, which directly conflicts with
+# mineru[pipeline]'s (unconditional, every version) `pillow>=11.0.0` -- no
+# overlapping version exists, so it can't go in requirements-gpu.txt's
+# normal resolved install. Install it with --no-deps (skip pip re-checking/
+# reinstalling its own pillow/torch/transformers pins -- which would also
+# risk re-triggering the nvidia-*-cu12 version stomping the pass above just
+# fixed) and separately install the rest of ITS OWN direct deps not already
+# covered by requirements-gpu.txt -- excluding pillow (keep mineru's
+# >=11.0.0), opencv-python-headless (already have opencv-python), torch,
+# and transformers (mineru's own pin already satisfies surya's floor). This
+# assumes surya's code works fine against Pillow 11 despite its
+# conservative upper pin -- only its TableRecPredictor is used in this
+# project (basic PIL Image open/convert/resize), so this should be safe,
+# but re-verify against real table crops after building.
+RUN pip install --no-cache-dir --no-deps surya-ocr==0.17.1 \
+    && pip install --no-cache-dir \
+        "click<9.0.0,>=8.1.8" \
+        "filetype<2.0.0,>=1.2.0" \
+        "platformdirs<5.0.0,>=4.3.6" \
+        "pydantic<3.0.0,>=2.5.3" \
+        "pydantic-settings<3.0.0,>=2.1.0" \
+        "pypdfium2==4.30.0" \
+        "python-dotenv<2.0.0,>=1.0.0"
+
+# table_cls==1.2.0 (RapidAI wired/wireless table classifier) depends on bare
+# `onnxruntime` (CPU build) -- installing it normally would pull that in
+# alongside `onnxruntime-gpu` into the same site-packages/onnxruntime/
+# directory and can silently break the GPU one (the exact onnxruntime vs
+# onnxruntime-gpu incident hit earlier on vast.ai). --no-deps skips that,
+# then its other direct deps not already covered above (numpy, opencv-python,
+# Shapely, requests) get installed explicitly.
+RUN pip install --no-cache-dir --no-deps table_cls==1.2.0 \
+    && pip install --no-cache-dir scipy scikit-image tqdm
 
 COPY . .
 
-# Pre-download PP-DocLayout weights at build time so the container's first
-# request doesn't stall on a cold download.
-RUN python -c "from paddleocr import LayoutDetection; LayoutDetection(model_name='PP-DocLayout_plus-L')"
+# Pre-download PP-DocLayout weights -- BEST EFFORT ONLY, not required to
+# succeed here. `paddlepaddle-gpu` links `libpaddle.so` directly against the
+# real NVIDIA driver's `libcuda.so.1` -- even a plain `import paddle` crashes
+# with "ImportError: libcuda.so.1: cannot open shared object file" on any
+# machine/container that doesn't have the driver present, REGARDLESS of
+# requested device (cpu/gpu). `docker build` never has GPU access (only
+# `docker run`/`docker compose up --gpus`/`deploy.reservations.devices` do,
+# see docker-compose.gpu.yml) -- so this import is EXPECTED to fail during a
+# normal build and can't be fixed by retrying, pinning versions, or anything
+# else done at build time. Swallow the failure here and let it download
+# lazily on the container's first real request instead, when GPU is actually
+# available.
+RUN python -c "from paddleocr import LayoutDetection; LayoutDetection(model_name='PP-DocLayout_plus-L')" \
+    && echo "PP-DocLayout pre-downloaded OK" \
+    || echo "WARNING: skipping PP-DocLayout pre-download at build time (no GPU during docker build) -- will download on first real request instead"
+
+# RapidAI's table_cls QAnything classifier weight -- CPU-only, no paddle/CUDA
+# involved, so unlike PP-DocLayout above this CAN and MUST succeed at build
+# time. model_type="q" must match module/table/mineru_processor.py. Retries
+# a few times -- modelscope.cn downloads (table_cls's own, no retry logic in
+# that library) have been observed to drop mid-transfer on some networks
+# (IncompleteRead), which is a transient connectivity issue, not a code bug.
+RUN success=0; \
+    for i in 1 2 3 4 5; do \
+        python -c "from table_cls import TableCls; TableCls(model_type='q')" \
+        && { success=1; break; }; \
+        echo "table_cls pre-download attempt $i failed, retrying..."; \
+        sleep 5; \
+    done; \
+    [ "$success" = "1" ]
 
 EXPOSE 8000
 

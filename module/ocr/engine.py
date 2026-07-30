@@ -81,7 +81,7 @@ def load_model(model_dir, nm, device_id: int | None = None):
     global loaded_models
     loaded_model = loaded_models.get(model_cached_tag)
     if loaded_model:
-        logging.info(f"load_model {model_file_path} reuses cached model")
+        logging.info(f"[device] load_model {model_file_path} reuses cached model")
         return loaded_model
 
     if not os.path.exists(model_file_path):
@@ -121,21 +121,22 @@ def load_model(model_dir, nm, device_id: int | None = None):
             provider_options=[cuda_provider_options]
             )
         run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:" + str(resolved_device_id))
-        logging.info(f"load_model {model_file_path} uses GPU")
+        logging.info(f"[device] load_model {model_file_path} uses GPU (cuda:{resolved_device_id})")
     else:
         sess = ort.InferenceSession(
             model_file_path,
             options=options,
             providers=['CPUExecutionProvider'])
         run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu")
-        logging.info(f"load_model {model_file_path} uses CPU")
+        logging.info(f"[device] load_model {model_file_path} uses CPU")
     loaded_model = (sess, run_options)
     loaded_models[model_cached_tag] = loaded_model
     return loaded_model
 
 class TextRecognizer:
     def __init__(self, model_dir=None, device_id: int | None = None,
-                 weight_path: str = None, base_config_name: str = None):
+                 weight_path: str = None, base_config_name: str = None,
+                 max_batch_size: int = 64):
         assert base_config_name is not None, (
             "base_config_name bắt buộc phải truyền vào ('vgg_transformer' hoặc 'vgg_seq2seq')")
         assert weight_path is not None and os.path.exists(weight_path), (
@@ -147,16 +148,31 @@ class TextRecognizer:
         import torch
         dev = device_id if device_id is not None else 0
         config['device'] = f'cuda:{dev}' if torch.cuda.is_available() else 'cpu'
+        logging.info(f"[device] VietOCR ({base_config_name}): device={config['device']}")
         self.detector = Predictor(config)
+        # Caps how many text-line crops __call__() stacks into one
+        # predict_batch() forward pass at a time -- a dense page can have
+        # 100+ detected boxes, which would otherwise all get batched
+        # unbounded in one call and risk a GPU OOM.
+        self._max_batch_size = max_batch_size
 
     def __call__(self, img_list):
+        if not img_list:
+            return [], 0.0
+        pil_imgs = [
+            Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) if isinstance(img, np.ndarray) else img
+            for img in img_list
+        ]
+        # predict_batch() recognizes every crop in ONE encoder+decoder
+        # forward pass instead of one call per crop -- score is still
+        # discarded (hardcoded 1.0) here, matching this method's existing
+        # behavior/contract; callers that need the real confidence use
+        # self.detector.predict_batch()/predict() directly (see
+        # MinerUTableProcessor._recognize_from_boxes).
         results = []
-        for img in img_list:
-            # Ensure PIL Image
-            if isinstance(img, np.ndarray):
-                img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            text = self.detector.predict(img)
-            results.append((text, 1.0))
+        for start in range(0, len(pil_imgs), self._max_batch_size):
+            chunk = pil_imgs[start : start + self._max_batch_size]
+            results.extend((text, 1.0) for text, _prob in self.detector.predict_batch(chunk))
         return results, 0.0
 
 
@@ -296,7 +312,8 @@ def _build_mineru_text_detector(device: str):
 
 class OCR:
     def __init__(self, model_dir=None, vietocr_weight_path: str = None, vietocr_base_config: str = None,
-                 crop_pad_px_h: float = 3.0, crop_pad_px_w: float = 0.0, det_backend: str = "onnx"):
+                 crop_pad_px_h: float = 3.0, crop_pad_px_w: float = 0.0, det_backend: str = "onnx",
+                 det_max_batch_size: int = 8, vietocr_max_batch_size: int = 64):
         """
         If you have trouble downloading HuggingFace models, -_^ this might help!!
 
@@ -315,15 +332,17 @@ class OCR:
         devices = list(range(PARALLEL_DEVICES)) if PARALLEL_DEVICES else [0]
 
         if det_backend == "mineru":
+            devices_resolved = [f"cuda:{d}" if torch.cuda.is_available() else "cpu" for d in devices]
             self.text_detector = [
-                _build_mineru_text_detector(f"cuda:{d}" if torch.cuda.is_available() else "cpu")
-                for d in devices
+                _build_mineru_text_detector(dev) for dev in devices_resolved
             ]
+            logging.info(f"[device] OCR detector (mineru PP-OCRv6): device={devices_resolved}")
         elif det_backend == "onnx":
             # Only the DeepDoc ONNX detector depends on `model_dir` containing the
             # right files -- fall back to downloading them from HuggingFace if
             # missing. VietOCR weight resolution below is independent of this and
             # must fail loudly (not get masked by this fallback) if misconfigured.
+            # (load_model() itself already logs "uses GPU"/"uses CPU" per device below.)
             try:
                 self.text_detector = [TextDetector(model_dir, d) for d in devices]
             except Exception:
@@ -337,7 +356,8 @@ class OCR:
         self.text_recognizer = [TextRecognizer(
             model_dir, d,
             weight_path=vietocr_weight_path,
-            base_config_name=vietocr_base_config) for d in devices]
+            base_config_name=vietocr_base_config,
+            max_batch_size=vietocr_max_batch_size) for d in devices]
 
         self.drop_score = 0.5
         self.crop_image_res_index = 0
@@ -348,6 +368,13 @@ class OCR:
         # getting clipped without this.
         self.crop_pad_px_h = crop_pad_px_h
         self.crop_pad_px_w = crop_pad_px_w
+        # Caps how many images detect_raw_batch()/detect_sorted_batch() ask
+        # the detector to stack into one forward pass at a time (only takes
+        # effect for backends whose batch_predict() honors it, i.e. mineru's
+        # own detector -- see detect_raw_batch) -- keeps a document with
+        # many pages/table crops from OOMing GPU memory just because every
+        # image got handed to one batched call.
+        self._det_max_batch_size = det_max_batch_size
 
     @staticmethod
     def _pad_quad(points, pad_px_h, pad_px_w):
@@ -442,6 +469,85 @@ class OCR:
                 else:
                     break
         return _boxes
+
+    def detect_raw(self, img_bgr: np.ndarray, device_id: int | None = None) -> np.ndarray | None:
+        """Runs the shared text detector on ONE image, normalized to a
+        single result shape callers can rely on: None when nothing was
+        detected (the detector itself inconsistently returns either None
+        or an empty array), or the raw (unsorted) dt_boxes otherwise.
+
+        This is the ONE place `self.text_detector[device_id](...)` gets
+        called from -- every call site in the pipeline (deskew_page,
+        page-orientation scoring, run_ocr_page, table OCR) used to
+        reimplement this same detect+None-check pattern independently;
+        centralizing it here means a future change to HOW detection runs
+        (e.g. batching multiple images in one call) only has to happen in
+        one place.
+        """
+        if device_id is None:
+            device_id = 0
+        dt_boxes, _elapse = self.text_detector[device_id](img_bgr)
+        if dt_boxes is None or len(dt_boxes) == 0:
+            return None
+        return dt_boxes
+
+    def detect_sorted(self, img_bgr: np.ndarray, device_id: int | None = None) -> np.ndarray | None:
+        """detect_raw() + sorted_boxes() -- the reading-order-sorted variant
+        every caller except deskew_page() (which only needs box shapes for
+        its tilt-angle estimate, not reading order) actually wants."""
+        dt_boxes = self.detect_raw(img_bgr, device_id)
+        if dt_boxes is None:
+            return None
+        return self.sorted_boxes(dt_boxes)
+
+    def detect_raw_batch(self, img_list: list[np.ndarray], device_id: int | None = None) -> list[np.ndarray | None]:
+        """Detects text boxes for MULTIPLE images in one call.
+
+        Uses the detector's own `.batch_predict()` when available
+        (MinerU's own PP-OCRv6 detector, `ocr.det_backend: mineru`) -- a
+        real batched forward pass that ALREADY groups images by their own
+        preprocessed shape internally
+        (mineru/model/utils/tools/infer/predict_det.py::batch_predict),
+        so mixed-size images never get padded against each other -- no
+        shape-grouping needed on our side here, unlike the layout backend
+        (PaddleX's LayoutDetection does NOT do this itself, see
+        PPDocLayoutBackend.detect_batch).
+
+        Falls back to one call per image (via detect_raw) for detector
+        backends that don't expose `batch_predict` (the onnx det.onnx
+        detector) -- same result, just no batching speedup.
+
+        Returns one result per input image, in the SAME ORDER as
+        `img_list` -- either the raw dt_boxes array, or None if nothing
+        was detected.
+        """
+        if device_id is None:
+            device_id = 0
+        if not img_list:
+            return []
+
+        detector = self.text_detector[device_id]
+        if not hasattr(detector, "batch_predict"):
+            return [self.detect_raw(img, device_id) for img in img_list]
+
+        batch_results = detector.batch_predict(img_list, max_batch_size=self._det_max_batch_size)
+        if len(batch_results) != len(img_list):
+            raise RuntimeError(
+                f"Detector batch_predict returned {len(batch_results)} results "
+                f"for {len(img_list)} input images -- refusing to guess how they line up."
+            )
+        return [
+            dt_boxes if dt_boxes is not None and len(dt_boxes) > 0 else None
+            for dt_boxes, _elapse in batch_results
+        ]
+
+    def detect_sorted_batch(self, img_list: list[np.ndarray], device_id: int | None = None) -> list[np.ndarray | None]:
+        """detect_raw_batch() + sorted_boxes() per image."""
+        raw_results = self.detect_raw_batch(img_list, device_id)
+        return [
+            self.sorted_boxes(dt_boxes) if dt_boxes is not None else None
+            for dt_boxes in raw_results
+        ]
 
     def detect(self, img, device_id: int | None = None):
         if device_id is None:

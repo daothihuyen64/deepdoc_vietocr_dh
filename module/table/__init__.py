@@ -20,7 +20,11 @@ def get_table_processor(conf: dict, ocr: OCREngine) -> TableProcessor:
         )
     if backend == "mineru":
         from .mineru_processor import MinerUTableProcessor
-        return MinerUTableProcessor(ocr)
+        return MinerUTableProcessor(
+            ocr,
+            max_batch_size=table_conf.get("max_batch_size", 8),
+            vietocr_max_batch_size=conf.get("ocr", {}).get("vietocr_max_batch_size", 64),
+        )
     raise ValueError(f"Unknown table backend: {backend!r}")
 
 

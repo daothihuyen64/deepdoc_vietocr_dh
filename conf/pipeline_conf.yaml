@@ -34,6 +34,12 @@ layout:
   model_name: PP-DocLayout_plus-L
   # device: cpu   # uncomment to force a device; unset = auto-detect GPU/CPU
   threshold: 0.2
+  # Layout detection now runs ONCE per document, batched across all pages
+  # (see PPDocLayoutBackend.detect_batch / DocumentPipeline.process_pdf),
+  # instead of once per page. max_batch_size caps how many pages PaddleX
+  # stacks into one forward pass at a time, so a document with far more
+  # pages than fit in GPU memory at once doesn't OOM.
+  max_batch_size: 8
 
 ocr:
   model_dir: null
@@ -42,12 +48,32 @@ ocr:
   vietocr_base_config: "vgg_seq2seq"
   crop_pad_px_h: 3
   crop_pad_px_w: 0
+  # Caps how many images OCR.detect_raw_batch()/detect_sorted_batch() (used
+  # by page_orientation.py's batched 0-degree detect, and by the mineru
+  # table backend's batched wired-crop detect) stack into one forward pass
+  # at a time. Only takes effect for det_backend: mineru (its detector's
+  # own batch_predict() honors this) -- the onnx detector has no batch API
+  # at all, so this is a no-op for it.
+  max_batch_size: 8
+  # Caps how many text-line crops TextRecognizer.__call__() (whole-page
+  # VietOCR recognition, see module/ocr/engine.py) stacks into one
+  # Predictor.predict_batch() forward pass at a time. A dense page can have
+  # 100+ detected boxes -- without this cap they'd all get batched
+  # unbounded in one call, risking a GPU OOM. Higher than layout/table's
+  # max_batch_size (8) since VietOCR's per-crop cost is much smaller (a
+  # single text line vs a full page/table image).
+  vietocr_max_batch_size: 64
 
 tsr:
   threshold: 0.2
 
 table:
   backend: tsr   # tsr | mineru
+  # Caps how many table crops the mineru backend's process_batch() stacks
+  # into one TableOrientationCls / Surya (TableRecPredictor+DetectionPredictor)
+  # forward pass at a time, so a document with many tables doesn't hand
+  # them all to one unbounded batch call and risk a GPU OOM.
+  max_batch_size: 8
 
 mapping:
   overlap_threshold: 0.5

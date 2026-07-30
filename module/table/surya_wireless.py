@@ -21,19 +21,36 @@ class SuryaWirelessTableProcessor:
     Vietnamese diacritics more accurately.
     """
 
-    def __init__(self, vietocr_predictor) -> None:
+    def __init__(self, vietocr_predictor, max_batch_size: int = 8, vietocr_max_batch_size: int = 64) -> None:
         from surya.detection import DetectionPredictor
         from surya.table_rec import TableRecPredictor
 
         self._det = DetectionPredictor()
         self._table_rec = TableRecPredictor()
         self._vietocr = vietocr_predictor
+        # Caps how many crops call_batch() stacks into one TableRecPredictor/
+        # DetectionPredictor forward pass at a time -- a document with many
+        # wireless tables would otherwise hand every single one to one
+        # unbounded batch call and risk a GPU OOM.
+        self._max_batch_size = max_batch_size
+        # Caps how many text-line crops call_batch() stacks into one VietOCR
+        # predict_batch() forward pass at a time -- VietOCR's own per-crop
+        # cost is much smaller than TableRecPredictor/DetectionPredictor's,
+        # so it gets its own (usually higher) cap instead of reusing
+        # max_batch_size above.
+        self._vietocr_max_batch_size = vietocr_max_batch_size
         # Set by __call__ -- the [quad_box, text, score] triples this
         # instance's OWN detector+recognizer just produced, for
         # MinerUTableProcessor to reuse for the debug OCR overlay instead of
         # recomputing (and instead of showing the WRONG, shared-detector
         # boxes, which this path no longer uses).
         self.last_ocr_result: list = []
+        # Set by call_batch() -- one ocr_result list per image in the last
+        # batch call, same order, for MinerUTableProcessor.process_batch()
+        # to pick out the ocr_result matching whichever item it's building
+        # a debug overlay for (last_ocr_result above is meaningless once
+        # multiple images were processed in one call).
+        self.last_ocr_results: list[list] = []
 
     @staticmethod
     def _crop_with_margin(image: Image.Image, bbox, margin: int = 3) -> Image.Image:
@@ -135,28 +152,82 @@ class SuryaWirelessTableProcessor:
         return '<table border="1" cellspacing="0" cellpadding="4">\n' + "\n".join(html_rows) + "\n</table>"
 
     def __call__(self, img: np.ndarray) -> str:
-        pil_img = Image.fromarray(img).convert("RGB")
+        html = self.call_batch([img])[0]
+        self.last_ocr_result = self.last_ocr_results[0]
+        return html
 
-        table_pred = self._table_rec([pil_img])[0]
-        cells = table_pred.cells
+    def call_batch(self, imgs: list[np.ndarray]) -> list[str]:
+        """Batches `TableRecPredictor` + `DetectionPredictor` across
+        MULTIPLE table crops in ONE call each, instead of __call__()'s
+        one-crop-at-a-time path.
 
-        det_pred = self._det([pil_img])[0]
-        ocr_result = []
-        for box in det_pred.bboxes:
-            crop = self._crop_with_margin(pil_img, box.bbox)
-            if crop.size[0] < 2 or crop.size[1] < 2:
-                continue
-            text, score = self._vietocr.predict(crop, return_prob=True)
-            x1, y1, x2, y2 = box.bbox
-            # Keep the same [4-point quad, text, score] triple shape used
-            # everywhere else in this file, even though Surya's own bboxes
-            # are already axis-aligned rects -- _quad_to_bbox below reduces
-            # it right back, but this way ocr_result's shape never depends
-            # on which detector produced it.
-            quad = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-            ocr_result.append([quad, html_module.escape(text), score])
+        Both Surya predictors already do their OWN internal chunking
+        (`batch_size=` kwarg on `__call__`, defaulting to
+        `settings.TABLE_REC_BATCH_SIZE`/`DETECTOR_BATCH_SIZE` if omitted --
+        verified from source, `surya/table_rec/__init__.py`'s
+        `batch_table_recognition()` and `surya/detection/__init__.py`'s
+        `batch_detection()` both slice their own `images` list in a loop),
+        AND resize every image to a fixed canonical size independent of
+        whatever else is in the same call (`DetectionPredictor` even
+        splits tall images into fixed-height pieces and packs the batch by
+        a "how many pieces fit" budget, not a raw image count) -- so unlike
+        the layout backend (PaddleX's LayoutDetection, which does NOT do
+        any of this itself, see PPDocLayoutBackend.detect_batch), there's
+        nothing for US to chunk or size-group here: just pass
+        `self._max_batch_size` straight through as Surya's own `batch_size`.
 
-        self.last_ocr_result = ocr_result
+        VietOCR recognition batches every detected text line across ALL
+        images in this call into one flat list first (chunked by
+        self._vietocr_max_batch_size), instead of one predict() call per
+        line -- predict_batch() handles the variable-width padding/masking
+        correctly (see vietocr/tool/predictor.py).
 
-        cell_text_map = self._fill_cell_texts(cells, ocr_result)
-        return self._build_html_table(cells, cell_text_map)
+        Returns one HTML string per input image, in the SAME ORDER as
+        `imgs`. Also refreshes `self.last_ocr_results` (parallel list, one
+        ocr_result per image) for the caller's debug overlay.
+        """
+        if not imgs:
+            self.last_ocr_results = []
+            return []
+
+        pil_imgs = [Image.fromarray(img).convert("RGB") for img in imgs]
+        table_preds = self._table_rec(pil_imgs, batch_size=self._max_batch_size)
+        det_preds = self._det(pil_imgs, batch_size=self._max_batch_size)
+
+        # Flatten every detected text-line crop across ALL images into one
+        # list first, so VietOCR recognizes the whole document's table
+        # crops in as few batched forward passes as possible, instead of
+        # per-image.
+        flat_crops: list[Image.Image] = []
+        flat_quads: list[list] = []
+        owner_idx: list[int] = []
+        for i, (pil_img, det_pred) in enumerate(zip(pil_imgs, det_preds)):
+            for box in det_pred.bboxes:
+                crop = self._crop_with_margin(pil_img, box.bbox)
+                if crop.size[0] < 2 or crop.size[1] < 2:
+                    continue
+                x1, y1, x2, y2 = box.bbox
+                flat_crops.append(crop)
+                # Keep the same [4-point quad, text, score] triple shape
+                # used everywhere else in this file, even though Surya's
+                # own bboxes are already axis-aligned rects -- _quad_to_bbox
+                # reduces it right back, but this way ocr_result's shape
+                # never depends on which detector produced it.
+                flat_quads.append([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+                owner_idx.append(i)
+
+        flat_texts_scores = []
+        for start in range(0, len(flat_crops), self._vietocr_max_batch_size):
+            chunk = flat_crops[start : start + self._vietocr_max_batch_size]
+            flat_texts_scores.extend(self._vietocr.predict_batch(chunk))
+
+        ocr_results_per_image: list[list] = [[] for _ in imgs]
+        for owner, quad, (text, score) in zip(owner_idx, flat_quads, flat_texts_scores):
+            ocr_results_per_image[owner].append([quad, html_module.escape(text), score])
+
+        self.last_ocr_results = ocr_results_per_image
+        results = []
+        for table_pred, ocr_result in zip(table_preds, ocr_results_per_image):
+            cell_text_map = self._fill_cell_texts(table_pred.cells, ocr_result)
+            results.append(self._build_html_table(table_pred.cells, cell_text_map))
+        return results

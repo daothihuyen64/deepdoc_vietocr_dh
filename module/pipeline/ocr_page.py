@@ -34,10 +34,9 @@ def run_ocr_page(
     ori_im = img_bgr.copy()
 
     if dt_boxes is None:
-        dt_boxes, _ = ocr.text_detector[0](img_bgr)
-        if dt_boxes is None or len(dt_boxes) == 0:
+        dt_boxes = ocr.detect_sorted(img_bgr)
+        if dt_boxes is None:
             return []
-        dt_boxes = ocr.sorted_boxes(dt_boxes)
     elif len(dt_boxes) == 0:
         return []
 

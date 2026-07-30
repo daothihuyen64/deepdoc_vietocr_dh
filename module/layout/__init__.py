@@ -21,6 +21,7 @@ def get_layout_backend(conf: dict) -> LayoutBackend:
         return PPDocLayoutBackend(
             model_name=layout_conf.get("model_name", "PP-DocLayout_plus-L"),
             device=layout_conf.get("device") or _auto_layout_device(),
+            max_batch_size=layout_conf.get("max_batch_size", 8),
         )
     raise ValueError(f"Unknown layout backend: {backend!r}")
 

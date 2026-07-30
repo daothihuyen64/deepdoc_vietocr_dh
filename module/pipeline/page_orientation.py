@@ -4,6 +4,11 @@ from PIL import Image
 
 from ..ocr import OCREngine
 
+# Sentinel for correct_page_orientation()'s `dt_boxes_0` param -- lets a
+# caller distinguish "not supplied, detect it yourself" (default) from
+# "here's the answer, there really are zero boxes" (explicit None).
+_UNSET = object()
+
 
 # ── small-tilt deskew ─────────────────────────────────────────────────────────
 
@@ -24,12 +29,12 @@ def deskew_page(
     max_angle: float = 10.0,
 ) -> tuple[Image.Image, float]:
     """Corrects small page tilt from the median angle of detected text-line
-    boxes (shared `ocr.text_detector[0]` -- no separate model loaded).
+    boxes (shared detector via `ocr.detect_raw()` -- no separate model loaded).
 
     Returns (corrected_img, angle_degrees) -- angle=0.0 means unchanged.
     """
     img_bgr = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    dt_boxes, _ = ocr.text_detector[0](img_bgr)
+    dt_boxes = ocr.detect_raw(img_bgr)
     if dt_boxes is None or len(dt_boxes) < min_boxes:
         return img, 0.0
 
@@ -57,15 +62,6 @@ def deskew_page(
 
 
 # ── 0/90/270 orientation correction ───────────────────────────────────────────
-
-
-def _detect_boxes(img_bgr: np.ndarray, ocr: OCREngine) -> np.ndarray | None:
-    """Detection only -- no recognition. Used both for the geometry gate
-    (which never needs text) and as the first half of scoring a candidate."""
-    dt_boxes, _ = ocr.text_detector[0](img_bgr)
-    if dt_boxes is None or len(dt_boxes) == 0:
-        return None
-    return ocr.sorted_boxes(dt_boxes)
 
 
 def _sample_recognize(
@@ -111,7 +107,7 @@ def _score_orientation_candidate(
 ) -> tuple[float, np.ndarray | None, dict[int, tuple[str, float]]]:
     """Detect + sample-recognize a candidate rotation in one call. Returns
     (mean_score, sorted_dt_boxes, {box_index: (text, score)})."""
-    dt_boxes = _detect_boxes(img_bgr, ocr)
+    dt_boxes = ocr.detect_sorted(img_bgr)
     if dt_boxes is None:
         return 0.0, None, {}
     score, recognized = _sample_recognize(img_bgr, dt_boxes, ocr, sample_max, min_scores)
@@ -147,8 +143,19 @@ def correct_page_orientation(
     min_scores: int = 5,
     sideways_min_count: int = 4,
     sideways_min_ratio: float = 0.3,
+    dt_boxes_0=_UNSET,
 ) -> tuple[Image.Image, str, float, np.ndarray | None, dict[int, tuple[str, float]]]:
     """Detects 0 deg's boxes first -- detection ONLY, no recognition yet.
+
+    `dt_boxes_0`, when given, is used AS-IS instead of detecting here --
+    lets a caller batch-detect the 0-degree candidate for every page in
+    the document in one call (see DocumentPipeline.process_pdf /
+    OCR.detect_sorted_batch) instead of paying for a separate detect call
+    per page. Must be `ocr.sorted_boxes()`-sorted already, exactly what
+    `ocr.detect_sorted(img_bgr_0)` (the default when omitted) itself
+    returns -- `_UNSET` sentinel default (not None) so a caller can still
+    explicitly pass `dt_boxes_0=None` to mean "there really are zero boxes"
+    without that being confused with "not supplied, detect it yourself".
 
     If they don't geometrically look plausibly sideways (see
     `_looks_sideways` -- more than `sideways_min_count` AND more than
@@ -177,17 +184,17 @@ def correct_page_orientation(
     hands back.
     """
     img_bgr_0 = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    dt_boxes_0 = _detect_boxes(img_bgr_0, ocr)
+    boxes_0 = ocr.detect_sorted(img_bgr_0) if dt_boxes_0 is _UNSET else dt_boxes_0
 
-    if not _looks_sideways(dt_boxes_0, sideways_min_count, sideways_min_ratio):
-        if dt_boxes_0 is None:
+    if not _looks_sideways(boxes_0, sideways_min_count, sideways_min_ratio):
+        if boxes_0 is None:
             # No text detected at all (blank/image-only page) -- nothing to
             # score in either orientation, nothing to recognize.
-            return img, "0", 0.0, dt_boxes_0, {}
+            return img, "0", 0.0, boxes_0, {}
 
-        score_0, recognized_0 = _sample_recognize(img_bgr_0, dt_boxes_0, ocr, sample_max, min_scores)
+        score_0, recognized_0 = _sample_recognize(img_bgr_0, boxes_0, ocr, sample_max, min_scores)
         if score_0 > score_threshold:
-            return img, "0", score_0, dt_boxes_0, recognized_0
+            return img, "0", score_0, boxes_0, recognized_0
 
         img_bgr_180 = cv2.rotate(img_bgr_0, cv2.ROTATE_180)
         score_180, dt_boxes_180, recognized_180 = _score_orientation_candidate(
@@ -196,11 +203,11 @@ def correct_page_orientation(
         if score_180 > score_0:
             final_img = Image.fromarray(cv2.cvtColor(img_bgr_180, cv2.COLOR_BGR2RGB))
             return final_img, "180", score_180, dt_boxes_180, recognized_180
-        return img, "0", score_0, dt_boxes_0, recognized_0
+        return img, "0", score_0, boxes_0, recognized_0
 
-    score_0, recognized_0 = _sample_recognize(img_bgr_0, dt_boxes_0, ocr, sample_max, min_scores)
+    score_0, recognized_0 = _sample_recognize(img_bgr_0, boxes_0, ocr, sample_max, min_scores)
     best_score, best_label = score_0, "0"
-    best_img_bgr, best_dt_boxes, best_recognized = img_bgr_0, dt_boxes_0, recognized_0
+    best_img_bgr, best_dt_boxes, best_recognized = img_bgr_0, boxes_0, recognized_0
 
     if best_score <= score_threshold:
         for label, rotate_flag in (("90", cv2.ROTATE_90_COUNTERCLOCKWISE), ("270", cv2.ROTATE_90_CLOCKWISE)):
