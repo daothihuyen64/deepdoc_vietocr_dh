@@ -62,7 +62,7 @@ ocr:
   # unbounded in one call, risking a GPU OOM. Higher than layout/table's
   # max_batch_size (8) since VietOCR's per-crop cost is much smaller (a
   # single text line vs a full page/table image).
-  vietocr_max_batch_size: 64
+  vietocr_max_batch_size: 128
 
 tsr:
   threshold: 0.2
