@@ -180,6 +180,11 @@ def correct_page_orientation(
     dt_boxes_0 = _detect_boxes(img_bgr_0, ocr)
 
     if not _looks_sideways(dt_boxes_0, sideways_min_count, sideways_min_ratio):
+        if dt_boxes_0 is None:
+            # No text detected at all (blank/image-only page) -- nothing to
+            # score in either orientation, nothing to recognize.
+            return img, "0", 0.0, dt_boxes_0, {}
+
         score_0, recognized_0 = _sample_recognize(img_bgr_0, dt_boxes_0, ocr, sample_max, min_scores)
         if score_0 > score_threshold:
             return img, "0", score_0, dt_boxes_0, recognized_0

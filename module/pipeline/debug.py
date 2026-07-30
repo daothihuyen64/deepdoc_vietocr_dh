@@ -39,12 +39,14 @@ def save_input_image(img: Image.Image, out_dir: str, pn: int) -> None:
 
 
 def save_layout_debug(img: Image.Image, raw_blocks: list[LayoutBlock], out_dir: str, pn: int) -> None:
-    """Draws every layout bbox with its index + predicted type."""
+    """Draws every layout bbox with its index + predicted type + confidence."""
     canvas = img.convert("RGB")
     draw = ImageDraw.Draw(canvas)
     font = _load_font(16)
     for i, b in enumerate(raw_blocks):
-        _draw_tagged_box(draw, b["bbox"], f"{i}:{b['type']}", font)
+        score = b.get("score")
+        label = f"{i}:{b['type']}:{score:.2f}" if score is not None else f"{i}:{b['type']}"
+        _draw_tagged_box(draw, b["bbox"], label, font)
     canvas.save(os.path.join(out_dir, f"page_{pn + 1}_layout.png"))
 
 
