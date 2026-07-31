@@ -4,7 +4,7 @@ from .pp_doclayout import PPDocLayoutBackend
 
 def _auto_layout_device() -> str:
     """Same GPU/CPU auto-detection the OCR/TSR onnxruntime sessions and
-    VietOCR already use -- lets one codebase run on either a CPU-only dev
+    FastOCR already use -- lets one codebase run on either a CPU-only dev
     machine or a rented GPU box without touching config, unless the config
     explicitly pins a device."""
     try:

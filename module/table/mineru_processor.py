@@ -1,5 +1,7 @@
 import html as html_module
 import logging
+import time
+import traceback
 
 import numpy as np
 from PIL import Image
@@ -17,29 +19,200 @@ logger = logging.getLogger(__name__)
 import mineru.model.table.rec.unet_table.utils_table_recover as _unet  # noqa: E402
 _unet._cell_text = lambda m, i: " ".join(m.get(i, []))
 
-# MinerU's UnetTableModel.predict() (mineru/model/table/rec/unet_table/main.py)
-# decides wired-vs-wireless via 4 OR'd conditions. Per real testing on this
-# project's documents, the FIRST one -- a cell-count-based `switch_flag`
-# (estimates wired's table "scale" as sqrt(non-blank cell count), assuming a
-# roughly-square table, then switches to wireless whenever wireless reports
-# meaningfully more non-blank cells than that estimate) -- was misclassifying
-# genuinely wired tables as wireless too often (wireless's own structure
-# model can report more "non-blank cells" than wired even on a table that
-# IS wired, e.g. by segmenting a merged cell into several). The other 3
-# conditions (total-cell-count gap + wired-cell-shortfall, tiny-equal-count
-# tables, and wired-OCR-text-coverage shortfall -- see mineru_processor's
-# _wired.predict() docs) are kept EXACTLY as mineru implements them; only
-# this one heuristic is disabled. Reimplemented here (not just deleting a
-# few lines via monkeypatch, since switch_flag is computed inline, not in
-# its own patchable function) by copying predict()'s body from mineru
-# 2025-xx (see MinerU/mineru/model/table/rec/unet_table/main.py) with the
-# switch_flag block and the now-unused blank-cell BeautifulSoup counting
-# removed -- re-verify this patch still matches upstream's OTHER 3
-# conditions if mineru is ever upgraded.
+# ---------------------------------------------------------------------------
+# The 3 monkeypatches below add REAL batch support to MinerU's wired (UNet)
+# table pipeline, which the version of `mineru[pipeline]` this project
+# installs from PyPI does not have at all (only single-image `predict()`/
+# `__call__()`/`infer()` exist there -- confirmed by reading that package's
+# actual installed source). Ported from a WIP fork
+# (C:\Proton_X\MinerU, not a project dependency -- copied here, not
+# installed/imported from there) that adds true ONNX batch inference
+# (TSRUnet.batch_call: N images concatenated into ONE forward pass, instead
+# of always forcing batch=1) plus batched wired-vs-wireless orchestration on
+# top. Kept as monkeypatches (same pattern as `_cell_text` above) rather
+# than switching this project's mineru dependency to that fork, so every
+# deploy target (local/Docker/vast.ai) keeps installing plain
+# `mineru[pipeline]` from PyPI with zero changes -- this code IS the patch,
+# not a reference to an external package.
 import mineru.model.table.rec.unet_table.main as _unet_main  # noqa: E402
+import mineru.model.table.rec.unet_table.table_structure_unet as _unet_tsr  # noqa: E402
 
 
-def _wired_predict_without_cell_count_switch(self, input_img, ocr_result, wireless_html_code, return_metadata=False):
+def _tsr_postprocess_to_polygons(self, img, pred, **kwargs):
+    polygons, rotated_polygons = self.postprocess(img, pred, **kwargs)
+    if polygons.size == 0:
+        return None, None
+    polygons = polygons.reshape(polygons.shape[0], 4, 2)
+    polygons[:, 3, :], polygons[:, 1, :] = (
+        polygons[:, 1, :].copy(),
+        polygons[:, 3, :].copy(),
+    )
+    rotated_polygons = rotated_polygons.reshape(rotated_polygons.shape[0], 4, 2)
+    rotated_polygons[:, 3, :], rotated_polygons[:, 1, :] = (
+        rotated_polygons[:, 1, :].copy(),
+        rotated_polygons[:, 3, :].copy(),
+    )
+    _, idx = _unet.sorted_ocr_boxes(
+        [_unet.box_4_2_poly_to_box_4_1(poly_box) for poly_box in rotated_polygons],
+        threhold=0.4,
+    )
+    return polygons[idx], rotated_polygons[idx]
+
+
+def _tsr_batch_call(self, imgs, **kwargs):
+    """Batches N images into as few ONNX calls as possible -- TSRUnet.infer()
+    always forces batch=1 (`session(input["img"][None, ...])`); this groups
+    images by their (already deterministic) preprocessed shape and runs ONE
+    concatenated ONNX call PER GROUP instead.
+
+    preprocess() keeps each image's own aspect ratio (resize_img's
+    imrescale/rescale_size fits the image within (inp_height, inp_width)
+    WITHOUT forcing both dims to exactly that size -- only the LONGER side
+    hits the target; the shorter side ends up smaller unless the crop
+    happens to be square: `scale_factor = min(long_edge/max(h,w),
+    short_edge/min(h,w))`, applied to BOTH dims). Different table crops
+    generally have different aspect ratios, so their preprocessed shapes
+    differ too -- np.concatenate needs matching shapes.
+
+    An earlier version of this method zero-padded every image up to the
+    fixed (inp_height, inp_width) canvas instead of grouping, to allow ONE
+    single call regardless of shape. That was tried and REJECTED: UNet's
+    large receptive field (many conv layers + skip connections) reads the
+    artificial zero-padding border when convolving near the real image's
+    edge -- the model was never trained on inputs with an artificial zero
+    region like that, so its line-detection near that edge gets subtly
+    corrupted. Confirmed empirically (mineru side): padding produced 173
+    detected cells vs 174 for the padding-free single-image path on the
+    same table -- a real, silent accuracy regression, not just a
+    theoretical risk. Grouping by shape instead means every ONNX call is
+    byte-identical to the single-image path (no artificial content ever
+    added), at the cost of needing more than one call when a batch mixes
+    aspect ratios -- same shape-grouping technique already used for the
+    layout backend, see PPDocLayoutBackend.detect_batch(). Real PDFs
+    mostly have tables sharing 1-2 orientations, so this still batches
+    the large majority of same-shaped tables together in practice.
+    """
+    if not imgs:
+        return []
+    imgs_info = [self.preprocess(img) for img in imgs]
+
+    groups: dict[tuple[int, int], list[int]] = {}
+    for idx, info in enumerate(imgs_info):
+        _, _c, h, w = info["img"].shape
+        groups.setdefault((h, w), []).append(idx)
+
+    results: list = [None] * len(imgs)
+    for indices in groups.values():
+        batch = np.concatenate([imgs_info[i]["img"] for i in indices], axis=0)
+        raw_output = self.session([batch])[0]  # (1, len(indices), h, w)
+        for pos, idx in enumerate(indices):
+            pred = raw_output[0, pos].astype(np.uint8)
+            results[idx] = self._postprocess_to_polygons(imgs[idx], pred, **kwargs)
+    return results  # every index was filled by exactly one group above
+
+
+_unet_tsr.TSRUnet._postprocess_to_polygons = _tsr_postprocess_to_polygons
+_unet_tsr.TSRUnet.batch_call = _tsr_batch_call
+
+
+def _wired_call_with_polygons(self, img, ocr_result, polygons, rotated_polygons, **kwargs):
+    """The single-image part of WiredTableRecognition.__call__() (OCR-cell
+    matching + HTML generation) factored out so batch_call() below can
+    reuse it against ALREADY-computed TSRUnet polygons instead of
+    re-running structure detection per crop."""
+    need_ocr = kwargs.get("need_ocr", True) if kwargs else True
+    col_threshold = kwargs.get("col_threshold", 15) if kwargs else 15
+    row_threshold = kwargs.get("row_threshold", 10) if kwargs else 10
+
+    if polygons is None:
+        return _unet_main.WiredTableOutput("", None, None, 0.0)
+
+    s = time.perf_counter()
+    try:
+        table_res, logi_points = self.table_recover(rotated_polygons, row_threshold, col_threshold)
+        polygons[:, 1, :], polygons[:, 3, :] = (polygons[:, 3, :].copy(), polygons[:, 1, :].copy())
+        if not need_ocr:
+            sorted_polygons, idx_list = _unet.sorted_ocr_boxes(
+                [_unet.box_4_2_poly_to_box_4_1(box) for box in polygons]
+            )
+            return _unet_main.WiredTableOutput("", sorted_polygons, logi_points[idx_list], time.perf_counter() - s)
+
+        cell_box_det_map, _not_match_ocr_boxes = _unet_main.match_ocr_cell(ocr_result, polygons)
+        cell_box_det_map = self.fill_blank_rec(img, polygons, cell_box_det_map)
+        t_rec_ocr_list = self.transform_res(cell_box_det_map, polygons, logi_points)
+        t_rec_ocr_list = self.sort_and_gather_ocr_res(t_rec_ocr_list)
+        cell_box_det_map = {
+            t_box_ocr["cell_idx"]: [ocr_box_and_text[1] for ocr_box_and_text in t_box_ocr["t_ocr_res"]]
+            for t_box_ocr in t_rec_ocr_list
+        }
+        pred_html = _unet_main.plot_html_table(logi_points, cell_box_det_map, polygons)
+        polygons = np.array(polygons).reshape(-1, 8)
+        logi_points = np.array(logi_points)
+        elapse = time.perf_counter() - s
+    except Exception:
+        logger.warning("Wired table cell/HTML generation failed:\n%s", traceback.format_exc())
+        return _unet_main.WiredTableOutput("", None, None, 0.0)
+    return _unet_main.WiredTableOutput(pred_html, polygons, logi_points, elapse)
+
+
+def _wired_batch_call(self, imgs_with_ocr, **kwargs):
+    """imgs_with_ocr: list of (rgb_img, ocr_result) pairs -- batches TSRUnet
+    structure detection (one ONNX call for every image) then runs the
+    per-image OCR-matching/HTML-generation tail for each."""
+    if not imgs_with_ocr:
+        return []
+    imgs = [self.load_img(pair[0]) for pair in imgs_with_ocr]
+    ocr_results = [pair[1] for pair in imgs_with_ocr]
+    structure_results = self.table_structure.batch_call(imgs, **kwargs)
+    return [
+        self._call_with_polygons(img, ocr, polygons, rotated_polygons, **kwargs)
+        for img, ocr, (polygons, rotated_polygons) in zip(imgs, ocr_results, structure_results)
+    ]
+
+
+_unet_main.WiredTableRecognition._call_with_polygons = _wired_call_with_polygons
+_unet_main.WiredTableRecognition.batch_call = _wired_batch_call
+
+
+def _select_html_without_cell_count_switch(self, wired_html_code, wireless_html_code, ocr_result):
+    """Wired-vs-wireless decision -- factored out of predict() so both it
+    and batch_predict() below share ONE implementation.
+
+    MinerU's own version ORs in a 4th condition first: a cell-count-based
+    `switch_flag` (estimates wired's table "scale" as sqrt(non-blank cell
+    count), assuming a roughly-square table, then switches to wireless
+    whenever wireless reports meaningfully more non-blank cells than that
+    estimate). Per real testing on this project's documents, that
+    condition was misclassifying genuinely wired tables as wireless too
+    often (wireless's own structure model can report more "non-blank
+    cells" than wired even on a table that IS wired, e.g. by segmenting a
+    merged cell into several) -- deliberately DROPPED here. The other 3
+    conditions (total-cell-count gap + wired-cell-shortfall, tiny-equal-
+    count tables, wired-OCR-text-coverage shortfall) are kept exactly as
+    mineru implements them.
+    """
+    wired_len = _unet_main.count_table_cells_physical(wired_html_code)
+    wireless_len = _unet_main.count_table_cells_physical(wireless_html_code)
+    gap_of_len = wireless_len - wired_len
+
+    wireless_text_count = 0
+    wired_text_count = 0
+    for ocr_res in ocr_result:
+        if ocr_res[1] in (wireless_html_code or ""):
+            wireless_text_count += 1
+        if ocr_res[1] in (wired_html_code or ""):
+            wired_text_count += 1
+
+    if (
+        (0 <= gap_of_len <= 5 and wired_len <= round(wireless_len * 0.75))
+        or (gap_of_len == 0 and wired_len <= 4)
+        or (wired_text_count <= wireless_text_count * 0.6 and wireless_text_count >= 10)
+    ):
+        return "wireless", wireless_html_code
+    return "wired", wired_html_code
+
+
+def _wired_predict(self, input_img, ocr_result, wireless_html_code, return_metadata=False):
     if isinstance(input_img, Image.Image):
         np_img = np.asarray(input_img)
     elif isinstance(input_img, np.ndarray):
@@ -66,28 +239,7 @@ def _wired_predict_without_cell_count_switch(self, input_img, ocr_result, wirele
         )
 
         wired_html_code = wired_table_results.pred_html
-        wired_len = _unet_main.count_table_cells_physical(wired_html_code)
-        wireless_len = _unet_main.count_table_cells_physical(wireless_html_code)
-        gap_of_len = wireless_len - wired_len
-
-        wireless_text_count = 0
-        wired_text_count = 0
-        for ocr_res in ocr_result:
-            if ocr_res[1] in wireless_html_code:
-                wireless_text_count += 1
-            if ocr_res[1] in wired_html_code:
-                wired_text_count += 1
-
-        selected_model = "wired"
-        if (
-            (0 <= gap_of_len <= 5 and wired_len <= round(wireless_len * 0.75))
-            or (gap_of_len == 0 and wired_len <= 4)
-            or (wired_text_count <= wireless_text_count * 0.6 and wireless_text_count >= 10)
-        ):
-            html_code = wireless_html_code
-            selected_model = "wireless"
-        else:
-            html_code = wired_html_code
+        selected_model, html_code = self._select_html(wired_html_code, wireless_html_code, ocr_result)
 
         if return_metadata:
             return {
@@ -111,7 +263,47 @@ def _wired_predict_without_cell_count_switch(self, input_img, ocr_result, wirele
         return wireless_html_code
 
 
-_unet_main.UnetTableModel.predict = _wired_predict_without_cell_count_switch
+def _wired_batch_predict(self, table_res_list):
+    """Batches the wired (UNet) structure model across EVERY entry in
+    `table_res_list` that has a non-empty "ocr_result" in ONE ONNX call
+    (see WiredTableRecognition.batch_call/TSRUnet.batch_call above), then
+    runs the (cheap, CPU-only) wired-vs-wireless compare per entry.
+
+    Each entry is a dict: {"wired_table_img": ..., "ocr_result": ...,
+    "table_res": {"html": <wireless html, pre-filled>}}. Updates
+    table_res["html"] IN PLACE (to the winning HTML) for every entry that
+    had a usable ocr_result -- entries without one are left untouched
+    (keeping their pre-filled wireless HTML, same fallback as predict()'s
+    `if ocr_result:` guard). Also stashes table_res["selected_model"] (not
+    part of mineru's own version) so callers can still log which model won,
+    same as predict()'s return_metadata=True path does for the single-item case.
+    """
+    valid = [d for d in table_res_list if d.get("ocr_result")]
+    if not valid:
+        return
+
+    imgs_with_ocr = []
+    for d in valid:
+        img = d["wired_table_img"]
+        np_img = np.asarray(img) if isinstance(img, Image.Image) else img
+        imgs_with_ocr.append((np_img, d["ocr_result"]))
+
+    wired_outputs = self.wired_table_model.batch_call(imgs_with_ocr)
+
+    for d, wired_out in zip(valid, wired_outputs):
+        wireless_html = d["table_res"].get("html")
+        try:
+            selected_model, html_code = self._select_html(wired_out.pred_html, wireless_html, d["ocr_result"])
+        except Exception as e:
+            logger.warning("Wired-vs-wireless batch compare failed, falling back to wireless: %s", e)
+            selected_model, html_code = "wireless", wireless_html
+        d["table_res"]["html"] = html_code
+        d["table_res"]["selected_model"] = selected_model
+
+
+_unet_main.UnetTableModel._select_html = _select_html_without_cell_count_switch
+_unet_main.UnetTableModel.predict = _wired_predict
+_unet_main.UnetTableModel.batch_predict = _wired_batch_predict
 
 
 class MinerUTableProcessor:
@@ -143,14 +335,14 @@ class MinerUTableProcessor:
     `OCREngine` entirely -- `ocr.text_detector[0]` (whatever
     `ocr.det_backend` resolves to: the onnx detector by default, or
     MinerU's own PP-OCRv6 if configured) and `ocr.text_recognizer[0].detector`
-    (the VietOCR predictor module/ocr already loaded, same weight file) --
-    instead of loading a second VietOCR copy.
+    (the FastOCR predictor module/ocr already loaded, same weight file) --
+    instead of loading a second FastOCR copy.
 
     The WIRELESS path (`SuryaWirelessTableProcessor`) is the one deliberate
     exception: per explicit user request it uses Surya's OWN
     `DetectionPredictor` for bbox detection (mirroring
-    surya_v1_table_to_html_vietocr.ipynb exactly), NOT the shared detector --
-    only recognition there still reuses the shared VietOCR predictor.
+    surya_v1_table_to_html_fastocr.ipynb exactly), NOT the shared detector --
+    only recognition there still reuses the shared FastOCR predictor.
 
     `process_batch()` is an OPTIONAL extra entry point (not part of the
     `TableProcessor` protocol -- callers duck-type-check for it via
@@ -166,24 +358,39 @@ class MinerUTableProcessor:
     whatever `ocr.det_backend` is set to).
     """
 
-    def __init__(self, ocr: OCREngine, max_batch_size: int = 8, vietocr_max_batch_size: int = 64):
+    def __init__(
+        self,
+        ocr: OCREngine,
+        max_batch_size: int = 8,
+        fastocr_max_batch_size: int = 64,
+        wired_max_batch_size: int = 4,
+    ):
         from mineru.backend.pipeline.model_init import AtomModelSingleton
 
         self._ocr = ocr
-        self._vietocr = ocr.text_recognizer[0].detector
+        self._fastocr = ocr.text_recognizer[0].detector
         self._atom = AtomModelSingleton()
         # Caps how many crops process_batch() hands to TableOrientationCls
         # at once -- a document with many tables would otherwise batch them
         # all in one unbounded call and risk a GPU OOM.
         self._max_batch_size = max_batch_size
         # Caps how many text-line crops _recognize_from_boxes() (wired-table
-        # VietOCR recognition) and SuryaWirelessTableProcessor's own VietOCR
+        # FastOCR recognition) and SuryaWirelessTableProcessor's own FastOCR
         # calls stack into one predict_batch() forward pass at a time --
-        # shared with module/ocr/engine.py's page-level OCR cap (VietOCR's
+        # shared with module/ocr/engine.py's page-level OCR cap (FastOCR's
         # own per-crop cost is much smaller than a table-structure-model
         # forward pass, so it gets its own, usually higher, cap instead of
         # reusing max_batch_size above).
-        self._vietocr_max_batch_size = vietocr_max_batch_size
+        self._fastocr_max_batch_size = fastocr_max_batch_size
+        # Caps how many wired-classified table crops UnetTableModel.batch_predict()
+        # (monkeypatched in above) hands to TSRUnet.batch_call() at a time.
+        # Its own cap, separate from max_batch_size above -- batch_call()
+        # further splits this chunk into same-preprocessed-shape groups
+        # before actually batching (see _tsr_batch_call's docstring for why
+        # it groups instead of padding), so a document with many
+        # same-shaped wired tables doesn't still hand an unbounded number
+        # of them to one ONNX call within a single shape group.
+        self._wired_max_batch_size = wired_max_batch_size
         # Set by __call__ once TableCls has run -- "wire" or "wireless".
         # Read by document_pipeline.py (via getattr, since only this backend
         # has the concept) to suffix the deskewed-crop debug filename.
@@ -215,9 +422,9 @@ class MinerUTableProcessor:
         self._wired = self._atom.get_atom_model(atom_model_name=AtomicModel.WiredTable, lang=None)
         logger.info("[device] WiredTable / UNet (mineru): device=%s", get_device())
         self._surya = SuryaWirelessTableProcessor(
-            self._vietocr,
+            self._fastocr,
             max_batch_size=self._max_batch_size,
-            vietocr_max_batch_size=self._vietocr_max_batch_size,
+            fastocr_max_batch_size=self._fastocr_max_batch_size,
         )
         logger.info(
             "[device] Surya (wireless table structure + detector): device=%s",
@@ -283,15 +490,15 @@ class MinerUTableProcessor:
         return fixed
 
     def _recognize_from_boxes(self, bgr: np.ndarray, dt_boxes) -> list:
-        """VietOCR recognition for ALREADY-detected boxes -- shared by
+        """FastOCR recognition for ALREADY-detected boxes -- shared by
         _run_ocr() (detects then recognizes, single crop) and
         process_batch() (detects ALL wired crops in one batched call, then
         calls this per-crop for the recognition step).
 
-        Recognizes every box's crop in ONE VietOCR encoder+decoder forward
-        pass (chunked by self._vietocr_max_batch_size), instead of one call
+        Recognizes every box's crop in ONE FastOCR encoder+decoder forward
+        pass (chunked by self._fastocr_max_batch_size), instead of one call
         per box -- predict_batch() handles the variable-width padding/masking
-        correctly (see vietocr/tool/predictor.py).
+        correctly (see fastocr/tool/predictor.py).
 
         Returns list of [quad_box (4x2 list), html_escaped_text (str), score (float)].
         """
@@ -302,7 +509,7 @@ class MinerUTableProcessor:
 
         boxes = [np.array(box, dtype=np.float32) for box in dt_boxes]
         # Use the SAME crop function (with its tuned diacritic padding) that
-        # the shared VietOCR predictor was validated against -- MinerU's own
+        # the shared FastOCR predictor was validated against -- MinerU's own
         # get_rotate_crop_image_for_text_rec() crops tighter and was
         # clipping Vietnamese diacritics, degrading recognition.
         crops = [
@@ -311,17 +518,17 @@ class MinerUTableProcessor:
         ]
 
         result = []
-        for start in range(0, len(crops), self._vietocr_max_batch_size):
-            chunk_boxes = boxes[start : start + self._vietocr_max_batch_size]
-            chunk_crops = crops[start : start + self._vietocr_max_batch_size]
-            for box, (text, score) in zip(chunk_boxes, self._vietocr.predict_batch(chunk_crops)):
+        for start in range(0, len(crops), self._fastocr_max_batch_size):
+            chunk_boxes = boxes[start : start + self._fastocr_max_batch_size]
+            chunk_crops = crops[start : start + self._fastocr_max_batch_size]
+            for box, (text, score) in zip(chunk_boxes, self._fastocr.predict_batch(chunk_crops)):
                 result.append([box.tolist(), html_module.escape(text), score])
 
         return result
 
     def _run_ocr(self, img: np.ndarray) -> list:
         """Shared detector (via ocr.detect_sorted()) finds bbox -> shared
-        VietOCR predictor reads text (single crop; process_batch() uses
+        FastOCR predictor reads text (single crop; process_batch() uses
         detect_sorted_batch() + _recognize_from_boxes() instead to batch
         the detection step across multiple wired crops).
         """
@@ -429,11 +636,14 @@ class MinerUTableProcessor:
             Chunked by THIS class's own self._max_batch_size (table crops),
             not the OCR instance's page-level default -- a sane batch size
             for full pages and for small table crops isn't the same number.
-        Classification (table_cls) and the wired (UNet) model itself stay
-        per-crop -- neither library exposes a batch API (see class
-        docstring for why UNet specifically can't be batched: its
-        postprocessing is classical per-image OpenCV line/contour
-        detection, not a vectorizable batch operation).
+          - The wired (UNet) structure model itself, across every
+            WIRED-classified crop with a usable ocr_result, in ONE ONNX
+            call -- see UnetTableModel.batch_predict() monkeypatched in
+            above the top of this file. Vanilla `mineru[pipeline]` (from
+            PyPI) has no batch API for this model at all; this project adds
+            one via monkeypatch rather than depending on a custom fork.
+        Only classification (table_cls) stays genuinely per-crop -- that
+        library exposes no batch API at all.
 
         `items` is a list of (pn, tno, crop) -- pn/tno are only used for
         logging/debug filenames, not for anything semantic. Returns one
@@ -470,28 +680,53 @@ class MinerUTableProcessor:
             for i, bgr, dt_boxes in zip(wired_positions, wired_bgrs, wired_dt_boxes_batch)
         }
 
-        self.last_table_kinds = []
-        results = []
-        for i, ((pn, tno, img, is_wired), wireless_html, surya_ocr_result) in enumerate(
-            zip(prepared, wireless_htmls, surya_ocr_results)
-        ):
-            kind = "wire" if is_wired else "wireless"
-            self.last_table_kinds.append(kind)
+        self.last_table_kinds = [
+            "wire" if is_wired else "wireless" for _pn, _tno, _img, is_wired in prepared
+        ]
+        for (pn, tno, _img, _is_wired), kind in zip(prepared, self.last_table_kinds):
             logger.info("Page %d table %d: classified as %s", pn + 1, tno, kind)
+
+        # Wired (UNet) structure model, batched across ALL wired-classified
+        # crops with a usable ocr_result -- chunked by self._wired_max_batch_size
+        # (NOT an unbounded single call: every crop here gets padded to a
+        # fixed (1024,1024) canvas before the ONNX forward pass, a much
+        # bigger per-item tensor than TableOrientationCls/Surya's own input,
+        # so a document with many wired tables could otherwise OOM a GPU in
+        # one shot). table_res["html"] is pre-filled with the wireless HTML
+        # so batch_predict() only needs to OVERWRITE it for entries it
+        # actually processed; entries it skips (empty ocr_result) keep
+        # their wireless fallback automatically -- same semantics as the
+        # old per-crop `if ocr_result: ... else: final_html = wireless_html`.
+        table_res_list = [
+            {
+                "wired_table_img": prepared[i][2],
+                "ocr_result": wired_ocr_results[i],
+                "table_res": {"html": wireless_htmls[i]},
+            }
+            for i in wired_positions
+        ]
+        for start in range(0, len(table_res_list), self._wired_max_batch_size):
+            chunk = table_res_list[start : start + self._wired_max_batch_size]
+            self._wired.batch_predict(chunk)
+        wired_html_by_pos = dict(zip(wired_positions, table_res_list))
+
+        results = []
+        for i, (pn, tno, img, is_wired) in enumerate(prepared):
+            kind = self.last_table_kinds[i]
+            wireless_html = wireless_htmls[i]
 
             if is_wired:
                 ocr_result = wired_ocr_results[i]
-                if ocr_result:
-                    result = self._wired.predict(img, ocr_result, wireless_html, return_metadata=True)
-                    final_html = result["html"]
+                entry = wired_html_by_pos[i]
+                final_html = entry["table_res"]["html"]
+                selected_model = entry["table_res"].get("selected_model")
+                if selected_model:
                     logger.info(
                         "Page %d table %d: wired-vs-wireless compare -> selected %s",
-                        pn + 1, tno, result["selected_model"],
+                        pn + 1, tno, selected_model,
                     )
-                else:
-                    final_html = wireless_html
             else:
-                ocr_result = surya_ocr_result
+                ocr_result = surya_ocr_results[i]
                 final_html = wireless_html
 
             if debug_dir:

@@ -112,7 +112,7 @@ class PPDocLayoutBackend:
         # PaddlePaddle's own GPU allocator, like PyTorch's, holds freed
         # memory reserved for reuse within this SAME process instead of
         # returning it to the driver -- fine on its own, but this project
-        # also runs PyTorch models (VietOCR, mineru's OCR detector, Surya)
+        # also runs PyTorch models (FastOCR, mineru's OCR detector, Surya)
         # in the SAME process/GPU, with their OWN separate allocator that
         # can't reclaim memory Paddle is still holding. A big batch here
         # (many same-shaped pages at once) can leave Paddle holding
@@ -120,12 +120,12 @@ class PPDocLayoutBackend:
         # starving a later PyTorch call (e.g. Surya's table detection)
         # even on a small GPU that would otherwise have had room -- see
         # the equivalent torch.cuda.empty_cache() call in
-        # vietocr/tool/predictor.py's predict_batch() for the mirror-image
+        # fastocr/tool/predictor.py's predict_batch() for the mirror-image
         # problem (torch starving Paddle) this was found alongside.
         if self._device.startswith("gpu"):
             import paddle
             # Temporary diagnostic instrumentation (mirrors the equivalent
-            # torch before/after log in vietocr/tool/predictor.py's
+            # torch before/after log in fastocr/tool/predictor.py's
             # predict_batch()) -- confirms on a live server whether Paddle
             # really was holding a large chunk of "reserved but unused" GPU
             # memory before deciding this fix is enough on its own.

@@ -23,7 +23,8 @@ def get_table_processor(conf: dict, ocr: OCREngine) -> TableProcessor:
         return MinerUTableProcessor(
             ocr,
             max_batch_size=table_conf.get("max_batch_size", 8),
-            vietocr_max_batch_size=conf.get("ocr", {}).get("vietocr_max_batch_size", 64),
+            fastocr_max_batch_size=conf.get("ocr", {}).get("fastocr_max_batch_size", 64),
+            wired_max_batch_size=table_conf.get("wired_max_batch_size", 4),
         )
     raise ValueError(f"Unknown table backend: {backend!r}")
 

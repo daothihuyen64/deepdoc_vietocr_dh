@@ -6,9 +6,20 @@ FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
 # libgl1/libglib2.0-0/libsm6/libxext6/libxrender1: required by opencv-python.
 # libgomp1: required by onnxruntime.
 # fonts-dejavu-core: Vietnamese-capable TTF used to label debug bbox overlays.
+# build-essential + python3-dev: torch==2.13.0 silently routes some matmul
+# patterns (e.g. RoPE frequency computation -- hit via Surya's TableRecPredictor
+# decoder here, but not specific to it) through a Triton-JIT-compiled kernel
+# at *runtime* -- even when nothing in this codebase asks for Triton
+# directly. Triton's CUDA driver shim compiles a small CPython C-extension
+# (cuda_utils.c, `#include <Python.h>`) to talk to the driver, which needs
+# BOTH a real C compiler (build-essential) AND the Python dev headers
+# (python3-dev, for Python.h -- build-essential alone doesn't provide this)
+# available at runtime. Neither is present by default on the base image (a
+# "-runtime-" CUDA image, not "-devel-").
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
+    python3-dev \
     poppler-utils \
     libgl1 \
     libglib2.0-0 \
@@ -17,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libgomp1 \
     fonts-dejavu-core \
+    build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
 
@@ -31,18 +43,30 @@ COPY requirements-gpu.txt .
 # working manually on vast.ai (see vastai_gpu_deploy_TEST_deepdoc_vietocr_dh_test.txt
 # BUOC 6): paddlepaddle-gpu FIRST, then requirements-gpu.txt (which pulls in
 # mineru[pipeline]'s own transitive torch as a side effect), THEN torch/
-# torchvision pinned via --force-reinstall LAST so our exact verified pair
-# wins over whatever mineru's resolver picked -- pip resolves torch's own
-# required nvidia-*-cu12 sub-deps automatically as part of that final step,
-# same as the vast.ai manual run (which needed no separate nvidia-*-cu12
-# pinning pass at all and still worked). An earlier version of this
-# Dockerfile installed torch BEFORE paddle (the reverse order), which is what
-# made a manual nvidia-*-cu12 override pass necessary in the first place --
-# no longer needed now that the order matches the validated recipe.
+# torchvision pinned LAST so our exact verified pair wins over whatever
+# mineru's resolver picked -- pip resolves torch's own required nvidia-*-cu1x
+# sub-deps automatically as part of that final step, same as the vast.ai
+# manual run (which needed no separate nvidia-*-cu12 pinning pass at all and
+# still worked). An earlier version of this Dockerfile installed torch
+# BEFORE paddle (the reverse order), which is what made a manual
+# nvidia-*-cu12 override pass necessary in the first place -- no longer
+# needed now that the order matches the validated recipe.
+#
+# The final torch/torchvision install only actually reinstalls if mineru's
+# own resolver (the requirements-gpu.txt step above) landed on a DIFFERENT
+# version than the pin -- avoids redundantly re-downloading/reinstalling
+# ~1.5GB of torch + nvidia-*-cu1x wheels when mineru's resolver already
+# picked the exact same version (observed in practice: it currently does).
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
     && pip install --no-cache-dir -r requirements-gpu.txt \
-    && pip install --no-cache-dir --force-reinstall torch==2.13.0 torchvision==0.28.0
+    && installed_torch="$(pip show torch 2>/dev/null | grep -i '^Version:' | awk '{print $2}')" \
+    && installed_tv="$(pip show torchvision 2>/dev/null | grep -i '^Version:' | awk '{print $2}')" \
+    && if [ "$installed_torch" = "2.13.0" ] && [ "$installed_tv" = "0.28.0" ]; then \
+        echo "torch==$installed_torch / torchvision==$installed_tv already match the pin, skipping reinstall"; \
+    else \
+        pip install --no-cache-dir --force-reinstall torch==2.13.0 torchvision==0.28.0; \
+    fi
 
 # surya-ocr==0.17.1 declares `pillow<11.0.0`, which directly conflicts with
 # mineru[pipeline]'s (unconditional, every version) `pillow>=11.0.0` -- no

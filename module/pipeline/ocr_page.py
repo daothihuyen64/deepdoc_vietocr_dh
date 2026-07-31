@@ -14,9 +14,9 @@ from .types import OCRBox
 @dataclass
 class PageOcrPrep:
     """Per-page detection state, held between prepare_ocr_page() (detect +
-    crop, no VietOCR call) and finish_ocr_page() (assembles the final
+    crop, no FastOCR call) and finish_ocr_page() (assembles the final
     OCRBox list) -- split apart so process_pdf() can recognize every
-    page's crops in ONE VietOCR call spanning the WHOLE document, instead
+    page's crops in ONE FastOCR call spanning the WHOLE document, instead
     of one call per page (see DocumentPipeline.process_pdf()'s Phase 3a/3b).
     """
 
@@ -68,7 +68,7 @@ def prepare_ocr_page(
             crop_indices.append(bno)
 
         # Dumps the EXACT crops that need fresh recognition (post crop
-        # padding/rotate-90 decision) -- for debugging what VietOCR
+        # padding/rotate-90 decision) -- for debugging what FastOCR
         # actually sees per box, not a reconstruction of it. Boxes reused
         # from page_orientation.py's sample aren't re-cropped, so they
         # won't appear here.
@@ -167,7 +167,7 @@ def run_ocr_page(
     wrapper over prepare_ocr_page()/finish_ocr_page() for callers that
     don't need to batch recognition across multiple pages (e.g.
     DocumentPipeline.process_pdf() calls the two halves directly instead,
-    to recognize every page's crops in one whole-document VietOCR call).
+    to recognize every page's crops in one whole-document FastOCR call).
     """
     prep, crops = prepare_ocr_page(img_pil, ocr, crop_debug_dir, dt_boxes, prerecognized)
     fresh_rec_res, _ = ocr.text_recognizer[0](crops) if crops else ([], 0.0)

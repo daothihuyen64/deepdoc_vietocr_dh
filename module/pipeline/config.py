@@ -42,6 +42,9 @@ class PipelineConfig:
     page_orientation_min_scores: int
     page_orientation_sideways_min_count: int
     page_orientation_sideways_min_ratio: float
+    page_orientation_max_pages_per_batch: int
+    batch_api_max_pages_per_group: int
+    batch_api_max_images_per_group: int
 
     @classmethod
     def from_conf(cls, conf: dict) -> "PipelineConfig":
@@ -51,6 +54,7 @@ class PipelineConfig:
         crop_whitespace = conf.get("crop_whitespace", {})
         page_deskew = conf.get("page_deskew", {})
         page_orientation = conf.get("page_orientation", {})
+        batch_api = conf.get("batch_api", {})
         return cls(
             pdf_dpi=conf.get("pdf", {}).get("dpi", 200),
             layout_threshold=conf.get("layout", {}).get("threshold", 0.2),
@@ -84,4 +88,7 @@ class PipelineConfig:
             page_orientation_min_scores=page_orientation.get("min_scores", 5),
             page_orientation_sideways_min_count=page_orientation.get("sideways_min_count", 4),
             page_orientation_sideways_min_ratio=page_orientation.get("sideways_min_ratio", 0.3),
+            page_orientation_max_pages_per_batch=page_orientation.get("max_pages_per_batch", 15),
+            batch_api_max_pages_per_group=batch_api.get("max_pages_per_group", 200),
+            batch_api_max_images_per_group=batch_api.get("max_images_per_group", 200),
         )

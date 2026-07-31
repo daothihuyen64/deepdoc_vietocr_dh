@@ -10,35 +10,35 @@ logger = logging.getLogger(__name__)
 class SuryaWirelessTableProcessor:
     """Wireless-table pipeline: Surya's `TableRecPredictor` (table structure)
     + Surya's own `DetectionPredictor` (text-line bbox detection) + the
-    shared VietOCR predictor (recognition) -- mirrors
-    `surya_v1_table_to_html_vietocr.ipynb` exactly, per explicit user
+    shared FastOCR predictor (recognition) -- mirrors
+    `surya_v1_table_to_html_fastocr.ipynb` exactly, per explicit user
     request to use Surya's own detector for this path specifically (unlike
     the rest of this file, which reuses the project's shared detector
     everywhere else -- this is the one deliberate exception).
 
-    Recognition still reuses the shared VietOCR predictor (passed in, not
-    loaded again) instead of Surya's own recognizer, since VietOCR reads
+    Recognition still reuses the shared FastOCR predictor (passed in, not
+    loaded again) instead of Surya's own recognizer, since FastOCR reads
     Vietnamese diacritics more accurately.
     """
 
-    def __init__(self, vietocr_predictor, max_batch_size: int = 8, vietocr_max_batch_size: int = 64) -> None:
+    def __init__(self, fastocr_predictor, max_batch_size: int = 8, fastocr_max_batch_size: int = 64) -> None:
         from surya.detection import DetectionPredictor
         from surya.table_rec import TableRecPredictor
 
         self._det = DetectionPredictor()
         self._table_rec = TableRecPredictor()
-        self._vietocr = vietocr_predictor
+        self._fastocr = fastocr_predictor
         # Caps how many crops call_batch() stacks into one TableRecPredictor/
         # DetectionPredictor forward pass at a time -- a document with many
         # wireless tables would otherwise hand every single one to one
         # unbounded batch call and risk a GPU OOM.
         self._max_batch_size = max_batch_size
-        # Caps how many text-line crops call_batch() stacks into one VietOCR
-        # predict_batch() forward pass at a time -- VietOCR's own per-crop
+        # Caps how many text-line crops call_batch() stacks into one FastOCR
+        # predict_batch() forward pass at a time -- FastOCR's own per-crop
         # cost is much smaller than TableRecPredictor/DetectionPredictor's,
         # so it gets its own (usually higher) cap instead of reusing
         # max_batch_size above.
-        self._vietocr_max_batch_size = vietocr_max_batch_size
+        self._fastocr_max_batch_size = fastocr_max_batch_size
         # Set by __call__ -- the [quad_box, text, score] triples this
         # instance's OWN detector+recognizer just produced, for
         # MinerUTableProcessor to reuse for the debug OCR overlay instead of
@@ -176,11 +176,11 @@ class SuryaWirelessTableProcessor:
         nothing for US to chunk or size-group here: just pass
         `self._max_batch_size` straight through as Surya's own `batch_size`.
 
-        VietOCR recognition batches every detected text line across ALL
+        FastOCR recognition batches every detected text line across ALL
         images in this call into one flat list first (chunked by
-        self._vietocr_max_batch_size), instead of one predict() call per
+        self._fastocr_max_batch_size), instead of one predict() call per
         line -- predict_batch() handles the variable-width padding/masking
-        correctly (see vietocr/tool/predictor.py).
+        correctly (see fastocr/tool/predictor.py).
 
         Returns one HTML string per input image, in the SAME ORDER as
         `imgs`. Also refreshes `self.last_ocr_results` (parallel list, one
@@ -195,7 +195,7 @@ class SuryaWirelessTableProcessor:
         det_preds = self._det(pil_imgs, batch_size=self._max_batch_size)
 
         # Flatten every detected text-line crop across ALL images into one
-        # list first, so VietOCR recognizes the whole document's table
+        # list first, so FastOCR recognizes the whole document's table
         # crops in as few batched forward passes as possible, instead of
         # per-image.
         flat_crops: list[Image.Image] = []
@@ -217,9 +217,9 @@ class SuryaWirelessTableProcessor:
                 owner_idx.append(i)
 
         flat_texts_scores = []
-        for start in range(0, len(flat_crops), self._vietocr_max_batch_size):
-            chunk = flat_crops[start : start + self._vietocr_max_batch_size]
-            flat_texts_scores.extend(self._vietocr.predict_batch(chunk))
+        for start in range(0, len(flat_crops), self._fastocr_max_batch_size):
+            chunk = flat_crops[start : start + self._fastocr_max_batch_size]
+            flat_texts_scores.extend(self._fastocr.predict_batch(chunk))
 
         ocr_results_per_image: list[list] = [[] for _ in imgs]
         for owner, quad, (text, score) in zip(owner_idx, flat_quads, flat_texts_scores):

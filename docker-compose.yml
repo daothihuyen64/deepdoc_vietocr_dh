@@ -12,6 +12,6 @@ services:
       # makes Docker create an empty directory there instead, which breaks
       # config loading).
       - ./conf/local.pipeline_conf.yaml:/app/conf/local.pipeline_conf.yaml:ro
-      # Live-mounted so swapping vietocr_weight_path to a new .pth file only
+      # Live-mounted so swapping fastocr_weight_path to a new .pth file only
       # needs `docker compose restart`, not a rebuild.
-      - ./vietocr/weight:/app/vietocr/weight:ro
+      - ./fastocr/weight:/app/fastocr/weight:ro

@@ -29,7 +29,7 @@ class TSRTableProcessor:
         cpns = tsr_result[0] if tsr_result else []
 
         crop_debug_dir = (
-            os.path.join(debug_dir, f"page_{pn + 1}_table_{tno}_vietocr_crops")
+            os.path.join(debug_dir, f"page_{pn + 1}_table_{tno}_fastocr_crops")
             if debug_dir else None
         )
         raw_ocr_crop = raw_ocr(crop, self.ocr, crop_debug_dir=crop_debug_dir)

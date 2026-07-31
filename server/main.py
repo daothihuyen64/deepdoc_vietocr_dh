@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     app.state.pipeline = None
 
 
-app = FastAPI(title="DeepDoc VietOCR API", lifespan=lifespan)
+app = FastAPI(title="DeepDoc FastOCR API", lifespan=lifespan)
 app.include_router(routes.router)
 # Mounted last so it doesn't shadow the /api/v1/... routes above -- serves
 # server/static/index.html at "/" as a minimal manual-test UI for the API.

@@ -9,7 +9,7 @@ services:
       - ./pipeline_outputs:/app/pipeline_outputs
       - ./debug_outputs:/app/debug_outputs
       - ./conf/local.pipeline_conf.yaml:/app/conf/local.pipeline_conf.yaml:ro
-      - ./vietocr/weight:/app/vietocr/weight:ro
+      - ./fastocr/weight:/app/fastocr/weight:ro
     deploy:
       resources:
         reservations:

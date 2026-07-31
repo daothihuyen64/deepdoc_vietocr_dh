@@ -9,6 +9,24 @@ def conf_realpath(conf_name):
     return os.path.join(file_utils.get_project_base_directory(), conf_path)
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge `override` into `base`, in place, returning `base`.
+
+    A plain `base.update(override)` replaces an entire nested dict (e.g.
+    `ocr:`) wholesale even if `override` only meant to set one sibling key --
+    silently dropping every other key under that section (this caused a real
+    incident: local.pipeline_conf.yaml's `ocr: {det_backend: mineru}` wiped
+    out `ocr.fastocr_max_batch_size` from the global config, and the code
+    silently fell back to its own hardcoded default instead).
+    """
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def read_config(conf_name=SERVICE_CONF):
     local_config = {}
     local_path = conf_realpath(f'local.{conf_name}')
@@ -25,5 +43,4 @@ def read_config(conf_name=SERVICE_CONF):
     if not isinstance(global_config, dict):
         raise ValueError(f'Invalid config file: "{global_config_path}".')
 
-    global_config.update(local_config)
-    return global_config
+    return _deep_merge(global_config, local_config)

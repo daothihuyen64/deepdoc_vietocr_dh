@@ -28,6 +28,14 @@ page_orientation:
   # page from being rotated by OCR noise alone.
   sideways_min_count: 4
   sideways_min_ratio: 0.3
+  # Caps how many PAGES' worth of orientation-candidate sample crops
+  # (up to sample_max boxes each) get flattened into ONE FastOCR
+  # predict_batch() call at a time, in batch_correct_page_orientation()'s
+  # per-round recognition step -- without this, a document with many
+  # pages needing the same round (e.g. all pages needing the 180-degree
+  # retry) would hand every one of their samples to a single unbounded
+  # batch call and risk a GPU OOM.
+  max_pages_per_batch: 30
 
 layout:
   backend: pp_doclayout
@@ -39,30 +47,35 @@ layout:
   # instead of once per page. max_batch_size caps how many pages PaddleX
   # stacks into one forward pass at a time, so a document with far more
   # pages than fit in GPU memory at once doesn't OOM.
-  max_batch_size: 8
+  max_batch_size: 16
 
 ocr:
   model_dir: null
   det_backend: onnx   # onnx | mineru -- bbox detector for BOTH page OCR and table OCR
-  vietocr_weight_path: "vietocr/weight/vgg_seq2seq.pth"
-  vietocr_base_config: "vgg_seq2seq"
+  fastocr_weight_path: "fastocr/weight/vgg_seq2seq.pth"
+  fastocr_base_config: "vgg_seq2seq"
   crop_pad_px_h: 3
   crop_pad_px_w: 0
-  # Caps how many images OCR.detect_raw_batch()/detect_sorted_batch() (used
-  # by page_orientation.py's batched 0-degree detect, and by the mineru
-  # table backend's batched wired-crop detect) stack into one forward pass
-  # at a time. Only takes effect for det_backend: mineru (its detector's
-  # own batch_predict() honors this) -- the onnx detector has no batch API
-  # at all, so this is a no-op for it.
-  max_batch_size: 8
+  # Caps how many FULL PAGES OCR.detect_raw_batch()/detect_sorted_batch()
+  # stack into one forward pass at a time, for the PAGE-level batched detect
+  # calls only -- Phase 1b's 0-degree baseline detect, and
+  # page_orientation.py's batched 180/90/270 candidate detect. Only takes
+  # effect for det_backend: mineru (its detector's own batch_predict()
+  # honors this) -- the onnx detector has no batch API at all, so this is a
+  # no-op for it. Table-crop-level batched detect (the mineru table
+  # backend's wired-crop detect in process_batch()) uses table.max_batch_size
+  # below instead, via detect_sorted_batch()'s own max_batch_size override --
+  # a sane batch size for full pages and for small table crops isn't the
+  # same number, so these are deliberately two separate knobs.
+  max_batch_size: 16
   # Caps how many text-line crops TextRecognizer.__call__() (whole-page
-  # VietOCR recognition, see module/ocr/engine.py) stacks into one
+  # FastOCR recognition, see module/ocr/engine.py) stacks into one
   # Predictor.predict_batch() forward pass at a time. A dense page can have
   # 100+ detected boxes -- without this cap they'd all get batched
   # unbounded in one call, risking a GPU OOM. Higher than layout/table's
-  # max_batch_size (8) since VietOCR's per-crop cost is much smaller (a
+  # max_batch_size (8) since FastOCR's per-crop cost is much smaller (a
   # single text line vs a full page/table image).
-  vietocr_max_batch_size: 128
+  fastocr_max_batch_size: 128
 
 tsr:
   threshold: 0.2
@@ -71,9 +84,21 @@ table:
   backend: tsr   # tsr | mineru
   # Caps how many table crops the mineru backend's process_batch() stacks
   # into one TableOrientationCls / Surya (TableRecPredictor+DetectionPredictor)
-  # forward pass at a time, so a document with many tables doesn't hand
-  # them all to one unbounded batch call and risk a GPU OOM.
-  max_batch_size: 8
+  # / shared-detector (wired-crop detect) forward pass at a time, so a
+  # document with many tables doesn't hand them all to one unbounded batch
+  # call and risk a GPU OOM. Separate from ocr.max_batch_size (page-level
+  # detect calls) -- a sane batch size for small table crops and for full
+  # pages isn't the same number.
+  max_batch_size: 64
+  # Caps how many wired-classified table crops the mineru backend's
+  # UnetTableModel.batch_predict() (monkeypatched into mineru_processor.py)
+  # hands to TSRUnet.batch_call() at a time. Own knob, separate from
+  # max_batch_size above -- batch_call() further groups this chunk by each
+  # crop's own preprocessed shape before actually batching (padding was
+  # tried and rejected -- see _tsr_batch_call's docstring for the confirmed
+  # accuracy regression it caused), so this still bounds how many
+  # SAME-shaped crops can land in one ONNX call within a single group.
+  wired_max_batch_size: 32
 
 mapping:
   overlap_threshold: 0.5
@@ -87,9 +112,20 @@ reading_order:
   anchor_min_width: 100
   anchor_band_mult: 1.0
 
+batch_api:
+  # /api/v1/ocr/pdfs: caps how many total PAGES across multiple uploaded
+  # PDFs get grouped into one combined batch (DocumentPipeline.process_pdf_group)
+  # before results are split back per-source-PDF and written to pipeline_outputs.
+  # A single PDF with more pages than this becomes its own group on its own
+  # (never split mid-file).
+  max_pages_per_group: 200
+  # /api/v1/ocr/images: caps how many uploaded IMAGES get grouped into one
+  # combined batch (DocumentPipeline.process_image_group) at a time.
+  max_images_per_group: 200
+
 output:
   dir: "./pipeline_outputs_v3_217f8c7ab6d9cf9ea3021032561c6441bbc2a2ed_fix_bang_wireless"
 
 debug:
-  enabled: true
+  enabled: false
   dir: "./debug_outputs"

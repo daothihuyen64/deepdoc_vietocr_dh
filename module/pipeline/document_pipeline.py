@@ -18,7 +18,7 @@ from .content import build_block_content, build_json, build_markdown
 from .debug import save_input_image, save_layout_debug, save_ocr_debug, save_table_crop
 from .loader import load_pdf_pages
 from .ocr_page import PageOcrPrep, finish_ocr_page, prepare_ocr_page
-from .page_orientation import correct_page_orientation, deskew_page
+from .page_orientation import batch_correct_page_orientation, deskew_page
 from .reading_order import sort_reading_order, tb_rows
 from .table import deskew_crop
 from .text_mapping import (
@@ -83,6 +83,140 @@ class DocumentPipeline:
             debug_dir = os.path.join(self.config.debug_dir, Path(label).stem)
             os.makedirs(debug_dir, exist_ok=True)
 
+        pages_blocks = self._process_pages_batch(pages, debug_dir)
+
+        t_build = time.time()
+        markdown = build_markdown(pages_blocks, self.layout.label_schema)
+        json_out = build_json(label, pages_blocks)
+        logger.info("Built JSON/markdown output in %.2fs", time.time() - t_build)
+
+        if debug_dir:
+            with open(os.path.join(debug_dir, "output.md"), "w", encoding="utf-8") as f:
+                f.write(markdown)
+
+        out_dir = os.path.join(self.config.output_dir, Path(label).stem)
+        os.makedirs(out_dir, exist_ok=True)
+        shutil.copyfile(pdf_path, os.path.join(out_dir, label if label.lower().endswith(".pdf") else f"{label}.pdf"))
+        with open(os.path.join(out_dir, "output.json"), "w", encoding="utf-8") as f:
+            json.dump(json_out, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(out_dir, "output.md"), "w", encoding="utf-8") as f:
+            f.write(markdown)
+
+        return {
+            "json": json_out,
+            "markdown": markdown,
+        }
+
+    def process_pdf_group(self, items: list[tuple[str, str]]) -> list[dict]:
+        """Batch-processes multiple PDFs' pages together as ONE combined
+        document (concatenating every PDF's pages into a single list before
+        running them through _process_pages_batch), then splits the result
+        back per-source-PDF for separate json/markdown/output-dir writes --
+        see server/routes.py's /pdfs endpoint, which groups uploads into
+        chunks of <=200 total pages before calling this once per chunk.
+
+        `items` is `[(pdf_path, label), ...]`, already grouped by the caller.
+        A PDF that fails to render is skipped (result marked "error") without
+        aborting the rest of the group. If the shared batched call itself
+        fails (rare -- e.g. a crash triggered by pathological page content),
+        every PDF in this group is marked "error" with the same message,
+        since a shared-model failure mid-batch can't be cheaply attributed
+        to one specific input.
+        """
+        results: list[dict] = []
+        all_pages: list[Image.Image] = []
+        # (label, pdf_path, start, end) -- end is exclusive, indexes into all_pages/pages_blocks.
+        boundaries: list[tuple[str, str, int, int]] = []
+        for pdf_path, label in items:
+            try:
+                pages = load_pdf_pages(pdf_path, dpi=self.config.pdf_dpi)
+            except Exception as e:
+                logger.exception("Failed to render %s, skipping", label)
+                results.append({"file": label, "status": "error", "error": str(e)})
+                continue
+            start = len(all_pages)
+            all_pages.extend(pages)
+            boundaries.append((label, pdf_path, start, len(all_pages)))
+
+        if not boundaries:
+            return results
+
+        try:
+            pages_blocks = self._process_pages_batch(all_pages, debug_dir=None)
+        except Exception as e:
+            logger.exception("Batched processing failed for a %d-PDF group", len(boundaries))
+            for label, _pdf_path, _start, _end in boundaries:
+                results.append({"file": label, "status": "error", "error": str(e)})
+            return results
+
+        for label, pdf_path, start, end in boundaries:
+            sub_blocks = pages_blocks[start:end]
+            markdown = build_markdown(sub_blocks, self.layout.label_schema)
+            json_out = build_json(label, sub_blocks)
+            out_dir = os.path.join(self.config.output_dir, Path(label).stem)
+            os.makedirs(out_dir, exist_ok=True)
+            shutil.copyfile(pdf_path, os.path.join(out_dir, label if label.lower().endswith(".pdf") else f"{label}.pdf"))
+            with open(os.path.join(out_dir, "output.json"), "w", encoding="utf-8") as f:
+                json.dump(json_out, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(out_dir, "output.md"), "w", encoding="utf-8") as f:
+                f.write(markdown)
+            results.append({"file": label, "status": "success", "output_dir": out_dir})
+
+        return results
+
+    def process_image_group(self, items: list[tuple[str, str]]) -> list[dict]:
+        """Same as process_pdf_group, but each item is one image (1 image ==
+        1 "page") instead of a multi-page PDF -- `items` is
+        `[(image_path, label), ...]`. See server/routes.py's /images endpoint.
+        """
+        results: list[dict] = []
+        all_pages: list[Image.Image] = []
+        loaded: list[tuple[str, str]] = []  # (label, image_path), 1:1 with all_pages
+        for image_path, label in items:
+            try:
+                img = Image.open(image_path)
+                img.load()
+            except Exception as e:
+                logger.exception("Failed to open image %s, skipping", label)
+                results.append({"file": label, "status": "error", "error": str(e)})
+                continue
+            all_pages.append(img)
+            loaded.append((label, image_path))
+
+        if not loaded:
+            return results
+
+        try:
+            pages_blocks = self._process_pages_batch(all_pages, debug_dir=None)
+        except Exception as e:
+            logger.exception("Batched processing failed for a %d-image group", len(loaded))
+            for label, _image_path in loaded:
+                results.append({"file": label, "status": "error", "error": str(e)})
+            return results
+
+        for (label, image_path), blocks in zip(loaded, pages_blocks):
+            sub_blocks = [blocks]
+            markdown = build_markdown(sub_blocks, self.layout.label_schema)
+            json_out = build_json(label, sub_blocks)
+            out_dir = os.path.join(self.config.output_dir, Path(label).stem)
+            os.makedirs(out_dir, exist_ok=True)
+            shutil.copyfile(image_path, os.path.join(out_dir, label))
+            with open(os.path.join(out_dir, "output.json"), "w", encoding="utf-8") as f:
+                json.dump(json_out, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(out_dir, "output.md"), "w", encoding="utf-8") as f:
+                f.write(markdown)
+            results.append({"file": label, "status": "success", "output_dir": out_dir})
+
+        return results
+
+    def _process_pages_batch(self, pages: list[Image.Image], debug_dir: str | None) -> list[list[PageBlock]]:
+        """Runs layout/OCR/table processing (batched across the whole
+        `pages` list) and returns each page's assembled blocks. Extracted
+        from process_pdf() so process_pdf_group()/process_image_group() can
+        feed it a page list concatenated from MULTIPLE source files (for
+        cross-file batching) and split the result back afterward -- this
+        method itself has no notion of "which file" a page came from.
+        """
         # Phase 1a: whitespace crop + deskew -- genuinely page-specific/
         # sequential, each one lightweight.
         t_prep = time.time()
@@ -107,10 +241,34 @@ class DocumentPipeline:
                 len(pages), time.time() - t_detect,
             )
 
-        # Phase 1c: per-page orientation correction, reusing the
-        # already-detected 0-degree candidate above.
+        # Phase 1c: orientation correction for ALL pages, batched across the
+        # whole document -- see page_orientation.py's
+        # batch_correct_page_orientation() (each round -- 0-degree score,
+        # then 180 for non-sideways pages or 90/270 for sideways pages that
+        # still need it -- is batched across every page still needing that
+        # round, instead of looping pages one at a time).
+        t_orient = time.time()
+        if self.config.page_orientation_enabled:
+            orient_results = batch_correct_page_orientation(
+                [p.img for p in pre_pages],
+                dt_boxes_0_per_page,
+                self.ocr,
+                score_threshold=self.config.page_orientation_score_threshold,
+                sample_max=self.config.page_orientation_sample_max,
+                min_scores=self.config.page_orientation_min_scores,
+                sideways_min_count=self.config.page_orientation_sideways_min_count,
+                sideways_min_ratio=self.config.page_orientation_sideways_min_ratio,
+                max_pages_per_batch=self.config.page_orientation_max_pages_per_batch,
+            )
+        else:
+            orient_results = [(p.img, "0", 0.0, None, None) for p in pre_pages]
+        logger.info(
+            "Batch-corrected orientation for %d pages in %.2fs",
+            len(pages), time.time() - t_orient,
+        )
+
         prepped = [
-            self._prepare_page_orientation(pn, pre_pages[pn], dt_boxes_0_per_page[pn], debug_dir)
+            self._prepare_page_orientation(pn, pre_pages[pn], orient_results[pn], debug_dir)
             for pn in range(len(pages))
         ]
 
@@ -185,10 +343,10 @@ class DocumentPipeline:
                 if debug_dir:
                     save_table_crop(crop, debug_dir, pn, tno, suffix=f"_{kind}" if kind else "")
 
-        # Phase 3a: per-page OCR detection + cropping (cheap, no VietOCR
+        # Phase 3a: per-page OCR detection + cropping (cheap, no FastOCR
         # call yet) -- collects every page's not-yet-recognized crops into
         # ONE flat list spanning the WHOLE document, mirroring table
-        # content's Phase 2.5/2.6 pattern, so VietOCR recognizes them all
+        # content's Phase 2.5/2.6 pattern, so FastOCR recognizes them all
         # in as few batched forward passes as possible instead of once per
         # page.
         t_ocr_prep = time.time()
@@ -200,7 +358,7 @@ class DocumentPipeline:
         # text ending up assigned to a different page.
         crop_owner_pn: list[int] = []
         for pn in range(len(pages)):
-            page_crop_debug_dir = os.path.join(debug_dir, f"page_{pn + 1}_vietocr_crops") if debug_dir else None
+            page_crop_debug_dir = os.path.join(debug_dir, f"page_{pn + 1}_fastocr_crops") if debug_dir else None
             prep, crops = prepare_ocr_page(
                 prepped[pn].img, self.ocr, crop_debug_dir=page_crop_debug_dir,
                 dt_boxes=prepped[pn].dt_boxes_reuse, prerecognized=prepped[pn].prerecognized_reuse,
@@ -214,8 +372,8 @@ class DocumentPipeline:
         )
 
         # Phase 3b: recognize EVERY crop across the WHOLE document in ONE
-        # VietOCR call -- TextRecognizer.__call__ still chunks internally
-        # by ocr.vietocr_max_batch_size (see module/ocr/engine.py), so this
+        # FastOCR call -- TextRecognizer.__call__ still chunks internally
+        # by ocr.fastocr_max_batch_size (see module/ocr/engine.py), so this
         # stays memory-bounded even for a huge multi-page document.
         t_ocr_rec = time.time()
         fresh_rec_res_all, _ = self.ocr.text_recognizer[0](all_ocr_crops) if all_ocr_crops else ([], 0.0)
@@ -245,28 +403,7 @@ class DocumentPipeline:
             self._process_page_after_layout(pn, prepped[pn], page_blocks[pn], pages_ocr_boxes[pn], debug_dir)
             for pn in range(len(pages))
         ]
-
-        t_build = time.time()
-        markdown = build_markdown(pages_blocks, self.layout.label_schema)
-        json_out = build_json(label, pages_blocks)
-        logger.info("Built JSON/markdown output in %.2fs", time.time() - t_build)
-
-        if debug_dir:
-            with open(os.path.join(debug_dir, "output.md"), "w", encoding="utf-8") as f:
-                f.write(markdown)
-
-        out_dir = os.path.join(self.config.output_dir, Path(label).stem)
-        os.makedirs(out_dir, exist_ok=True)
-        shutil.copyfile(pdf_path, os.path.join(out_dir, label if label.lower().endswith(".pdf") else f"{label}.pdf"))
-        with open(os.path.join(out_dir, "output.json"), "w", encoding="utf-8") as f:
-            json.dump(json_out, f, ensure_ascii=False, indent=2)
-        with open(os.path.join(out_dir, "output.md"), "w", encoding="utf-8") as f:
-            f.write(markdown)
-
-        return {
-            "json": json_out,
-            "markdown": markdown,
-        }
+        return pages_blocks
 
     def _prepare_page_pre_orientation(self, pn: int, img: Image.Image) -> _PrePage:
         """Whitespace crop + deskew -- kept separate from orientation
@@ -317,16 +454,15 @@ class DocumentPipeline:
         self,
         pn: int,
         pre: _PrePage,
-        dt_boxes_0,
+        orient_result: tuple,
         debug_dir: str | None = None,
     ) -> _PreparedPage:
-        """Orientation correction, reusing the 0-degree candidate detection
-        process_pdf() already batch-detected across all pages (Phase 1b) --
-        correct_page_orientation() only does its own detect when dt_boxes_0
-        isn't supplied (page_orientation_enabled: false path below never
-        even calls it, so the value is irrelevant there)."""
+        """Per-page bookkeeping (timing mark, debug image) for the
+        orientation result process_pdf() already computed for EVERY page,
+        batched across the whole document -- see
+        page_orientation.py's batch_correct_page_orientation(). No model
+        call happens in this method anymore."""
         cfg = self.config
-        img = pre.img
         timings = dict(pre.timings)
         t_stage = time.time()
 
@@ -336,17 +472,8 @@ class DocumentPipeline:
             timings[name] = now - t_stage
             t_stage = now
 
-        dt_boxes_reuse, prerecognized_reuse = None, None
+        img, orient_label, orient_score, dt_boxes_reuse, prerecognized_reuse = orient_result
         if cfg.page_orientation_enabled:
-            img, orient_label, orient_score, dt_boxes_reuse, prerecognized_reuse = correct_page_orientation(
-                img, self.ocr,
-                score_threshold=cfg.page_orientation_score_threshold,
-                sample_max=cfg.page_orientation_sample_max,
-                min_scores=cfg.page_orientation_min_scores,
-                sideways_min_count=cfg.page_orientation_sideways_min_count,
-                sideways_min_ratio=cfg.page_orientation_sideways_min_ratio,
-                dt_boxes_0=dt_boxes_0,
-            )
             logger.info("Page %d: orientation %s° (score=%.2f)", pn + 1, orient_label, orient_score)
         _mark("page_orientation")
 

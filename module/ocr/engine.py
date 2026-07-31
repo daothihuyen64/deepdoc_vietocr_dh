@@ -36,8 +36,8 @@ import torch
 
 from ..postprocess import build_post_process
 
-from vietocr.tool.predictor import Predictor
-from vietocr.tool.config import Cfg
+from fastocr.tool.predictor import Predictor
+from fastocr.tool.config import Cfg
 
 loaded_models = {}
 
@@ -148,7 +148,7 @@ class TextRecognizer:
         import torch
         dev = device_id if device_id is not None else 0
         config['device'] = f'cuda:{dev}' if torch.cuda.is_available() else 'cpu'
-        logging.info(f"[device] VietOCR ({base_config_name}): device={config['device']}")
+        logging.info(f"[device] FastOCR ({base_config_name}): device={config['device']}")
         self.detector = Predictor(config)
         # Caps how many text-line crops __call__() stacks into one
         # predict_batch() forward pass at a time -- a dense page can have
@@ -311,9 +311,9 @@ def _build_mineru_text_detector(device: str):
 
 
 class OCR:
-    def __init__(self, model_dir=None, vietocr_weight_path: str = None, vietocr_base_config: str = None,
+    def __init__(self, model_dir=None, fastocr_weight_path: str = None, fastocr_base_config: str = None,
                  crop_pad_px_h: float = 3.0, crop_pad_px_w: float = 0.0, det_backend: str = "onnx",
-                 det_max_batch_size: int = 8, vietocr_max_batch_size: int = 64):
+                 det_max_batch_size: int = 8, fastocr_max_batch_size: int = 64):
         """
         If you have trouble downloading HuggingFace models, -_^ this might help!!
 
@@ -340,7 +340,7 @@ class OCR:
         elif det_backend == "onnx":
             # Only the DeepDoc ONNX detector depends on `model_dir` containing the
             # right files -- fall back to downloading them from HuggingFace if
-            # missing. VietOCR weight resolution below is independent of this and
+            # missing. FastOCR weight resolution below is independent of this and
             # must fail loudly (not get masked by this fallback) if misconfigured.
             # (load_model() itself already logs "uses GPU"/"uses CPU" per device below.)
             try:
@@ -355,9 +355,9 @@ class OCR:
 
         self.text_recognizer = [TextRecognizer(
             model_dir, d,
-            weight_path=vietocr_weight_path,
-            base_config_name=vietocr_base_config,
-            max_batch_size=vietocr_max_batch_size) for d in devices]
+            weight_path=fastocr_weight_path,
+            base_config_name=fastocr_base_config,
+            max_batch_size=fastocr_max_batch_size) for d in devices]
 
         self.drop_score = 0.5
         self.crop_image_res_index = 0
@@ -500,7 +500,12 @@ class OCR:
             return None
         return self.sorted_boxes(dt_boxes)
 
-    def detect_raw_batch(self, img_list: list[np.ndarray], device_id: int | None = None) -> list[np.ndarray | None]:
+    def detect_raw_batch(
+        self,
+        img_list: list[np.ndarray],
+        device_id: int | None = None,
+        max_batch_size: int | None = None,
+    ) -> list[np.ndarray | None]:
         """Detects text boxes for MULTIPLE images in one call.
 
         Uses the detector's own `.batch_predict()` when available
@@ -517,6 +522,14 @@ class OCR:
         backends that don't expose `batch_predict` (the onnx det.onnx
         detector) -- same result, just no batching speedup.
 
+        `max_batch_size`, when given, overrides the instance-level
+        `ocr.max_batch_size` (self._det_max_batch_size) for THIS call only
+        -- lets a caller batching much SMALLER images (e.g. table crops,
+        see MinerUTableProcessor.process_batch) use its own cap instead of
+        whatever this OCR instance's page-level default happens to be,
+        since a sane batch size for full pages and for small crops isn't
+        the same number.
+
         Returns one result per input image, in the SAME ORDER as
         `img_list` -- either the raw dt_boxes array, or None if nothing
         was detected.
@@ -526,11 +539,13 @@ class OCR:
         if not img_list:
             return []
 
+        effective_max_batch_size = max_batch_size if max_batch_size is not None else self._det_max_batch_size
+
         detector = self.text_detector[device_id]
         if not hasattr(detector, "batch_predict"):
             return [self.detect_raw(img, device_id) for img in img_list]
 
-        batch_results = detector.batch_predict(img_list, max_batch_size=self._det_max_batch_size)
+        batch_results = detector.batch_predict(img_list, max_batch_size=effective_max_batch_size)
         if len(batch_results) != len(img_list):
             raise RuntimeError(
                 f"Detector batch_predict returned {len(batch_results)} results "
@@ -541,9 +556,15 @@ class OCR:
             for dt_boxes, _elapse in batch_results
         ]
 
-    def detect_sorted_batch(self, img_list: list[np.ndarray], device_id: int | None = None) -> list[np.ndarray | None]:
-        """detect_raw_batch() + sorted_boxes() per image."""
-        raw_results = self.detect_raw_batch(img_list, device_id)
+    def detect_sorted_batch(
+        self,
+        img_list: list[np.ndarray],
+        device_id: int | None = None,
+        max_batch_size: int | None = None,
+    ) -> list[np.ndarray | None]:
+        """detect_raw_batch() + sorted_boxes() per image. `max_batch_size`
+        -- see detect_raw_batch()."""
+        raw_results = self.detect_raw_batch(img_list, device_id, max_batch_size)
         return [
             self.sorted_boxes(dt_boxes) if dt_boxes is not None else None
             for dt_boxes in raw_results
@@ -623,7 +644,7 @@ class OCR:
 
         # Dumps the EXACT crops handed to the recognizer below (post
         # TSR/layout detect, post crop padding) -- for debugging what
-        # VietOCR actually sees per box, not a reconstruction of it.
+        # FastOCR actually sees per box, not a reconstruction of it.
         if crop_debug_dir:
             os.makedirs(crop_debug_dir, exist_ok=True)
             for bno, img_crop in enumerate(img_crop_list):
