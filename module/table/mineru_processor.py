@@ -17,6 +17,102 @@ logger = logging.getLogger(__name__)
 import mineru.model.table.rec.unet_table.utils_table_recover as _unet  # noqa: E402
 _unet._cell_text = lambda m, i: " ".join(m.get(i, []))
 
+# MinerU's UnetTableModel.predict() (mineru/model/table/rec/unet_table/main.py)
+# decides wired-vs-wireless via 4 OR'd conditions. Per real testing on this
+# project's documents, the FIRST one -- a cell-count-based `switch_flag`
+# (estimates wired's table "scale" as sqrt(non-blank cell count), assuming a
+# roughly-square table, then switches to wireless whenever wireless reports
+# meaningfully more non-blank cells than that estimate) -- was misclassifying
+# genuinely wired tables as wireless too often (wireless's own structure
+# model can report more "non-blank cells" than wired even on a table that
+# IS wired, e.g. by segmenting a merged cell into several). The other 3
+# conditions (total-cell-count gap + wired-cell-shortfall, tiny-equal-count
+# tables, and wired-OCR-text-coverage shortfall -- see mineru_processor's
+# _wired.predict() docs) are kept EXACTLY as mineru implements them; only
+# this one heuristic is disabled. Reimplemented here (not just deleting a
+# few lines via monkeypatch, since switch_flag is computed inline, not in
+# its own patchable function) by copying predict()'s body from mineru
+# 2025-xx (see MinerU/mineru/model/table/rec/unet_table/main.py) with the
+# switch_flag block and the now-unused blank-cell BeautifulSoup counting
+# removed -- re-verify this patch still matches upstream's OTHER 3
+# conditions if mineru is ever upgraded.
+import mineru.model.table.rec.unet_table.main as _unet_main  # noqa: E402
+
+
+def _wired_predict_without_cell_count_switch(self, input_img, ocr_result, wireless_html_code, return_metadata=False):
+    if isinstance(input_img, Image.Image):
+        np_img = np.asarray(input_img)
+    elif isinstance(input_img, np.ndarray):
+        np_img = input_img
+    else:
+        raise ValueError("Input must be a pillow object or a numpy array.")
+
+    if ocr_result is None:
+        import cv2
+        bgr_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+        ocr_result = self.ocr_engine.ocr(bgr_img)[0]
+        ocr_result = [
+            [item[0], _unet_main.escape_html(item[1][0]), item[1][1]]
+            for item in ocr_result
+            if len(item) == 2 and isinstance(item[1], tuple)
+        ]
+
+    try:
+        wired_table_results = self.wired_table_model(np_img, ocr_result)
+        wired_structure_results = (
+            self.wired_table_model(np_img, need_ocr=False)
+            if return_metadata
+            else None
+        )
+
+        wired_html_code = wired_table_results.pred_html
+        wired_len = _unet_main.count_table_cells_physical(wired_html_code)
+        wireless_len = _unet_main.count_table_cells_physical(wireless_html_code)
+        gap_of_len = wireless_len - wired_len
+
+        wireless_text_count = 0
+        wired_text_count = 0
+        for ocr_res in ocr_result:
+            if ocr_res[1] in wireless_html_code:
+                wireless_text_count += 1
+            if ocr_res[1] in wired_html_code:
+                wired_text_count += 1
+
+        selected_model = "wired"
+        if (
+            (0 <= gap_of_len <= 5 and wired_len <= round(wireless_len * 0.75))
+            or (gap_of_len == 0 and wired_len <= 4)
+            or (wired_text_count <= wireless_text_count * 0.6 and wireless_text_count >= 10)
+        ):
+            html_code = wireless_html_code
+            selected_model = "wireless"
+        else:
+            html_code = wired_html_code
+
+        if return_metadata:
+            return {
+                "html": html_code,
+                "selected_model": selected_model,
+                "wired_cell_bboxes": None if wired_structure_results is None else wired_structure_results.cell_bboxes,
+                "wired_logic_points": None if wired_structure_results is None else wired_structure_results.logic_points,
+                "wired_html": wired_html_code,
+            }
+        return html_code
+    except Exception as e:
+        logger.warning("Wired-vs-wireless compare failed, falling back to wireless: %s", e)
+        if return_metadata:
+            return {
+                "html": wireless_html_code,
+                "selected_model": "wireless",
+                "wired_cell_bboxes": None,
+                "wired_logic_points": None,
+                "wired_html": "",
+            }
+        return wireless_html_code
+
+
+_unet_main.UnetTableModel.predict = _wired_predict_without_cell_count_switch
+
 
 class MinerUTableProcessor:
     """Table backend: orientation fix -> wired/wireless classify -> OCR ->
@@ -330,6 +426,9 @@ class MinerUTableProcessor:
           - The shared detector (ocr.detect_sorted_batch), across every
             WIRED-classified crop -- feeds both the wired model's own
             recognition and the compare heuristic's text-match count.
+            Chunked by THIS class's own self._max_batch_size (table crops),
+            not the OCR instance's page-level default -- a sane batch size
+            for full pages and for small table crops isn't the same number.
         Classification (table_cls) and the wired (UNet) model itself stay
         per-crop -- neither library exposes a batch API (see class
         docstring for why UNet specifically can't be batched: its
@@ -362,7 +461,10 @@ class MinerUTableProcessor:
         # Shared detector, batched across ALL wired-classified crops.
         wired_positions = [i for i, p in enumerate(prepared) if p[3]]
         wired_bgrs = [cv2.cvtColor(prepared[i][2], cv2.COLOR_RGB2BGR) for i in wired_positions]
-        wired_dt_boxes_batch = self._ocr.detect_sorted_batch(wired_bgrs) if wired_bgrs else []
+        wired_dt_boxes_batch = (
+            self._ocr.detect_sorted_batch(wired_bgrs, max_batch_size=self._max_batch_size)
+            if wired_bgrs else []
+        )
         wired_ocr_results = {
             i: self._recognize_from_boxes(bgr, dt_boxes)
             for i, bgr, dt_boxes in zip(wired_positions, wired_bgrs, wired_dt_boxes_batch)
