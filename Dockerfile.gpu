@@ -34,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+
+
 COPY requirements-gpu.txt .
 # CUDA-enabled torch/torchvision and PaddlePaddle's own GPU build (PaddlePaddle
 # isn't on PyPI for GPU -- it has its own CUDA-matched package index), matching

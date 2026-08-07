@@ -1,5 +1,6 @@
 import html as html_module
 import logging
+import threading
 
 import numpy as np
 from PIL import Image
@@ -39,18 +40,16 @@ class SuryaWirelessTableProcessor:
         # so it gets its own (usually higher) cap instead of reusing
         # max_batch_size above.
         self._fastocr_max_batch_size = fastocr_max_batch_size
-        # Set by __call__ -- the [quad_box, text, score] triples this
-        # instance's OWN detector+recognizer just produced, for
-        # MinerUTableProcessor to reuse for the debug OCR overlay instead of
-        # recomputing (and instead of showing the WRONG, shared-detector
-        # boxes, which this path no longer uses).
-        self.last_ocr_result: list = []
-        # Set by call_batch() -- one ocr_result list per image in the last
-        # batch call, same order, for MinerUTableProcessor.process_batch()
-        # to pick out the ocr_result matching whichever item it's building
-        # a debug overlay for (last_ocr_result above is meaningless once
-        # multiple images were processed in one call).
-        self.last_ocr_results: list[list] = []
+        # This instance (and _det/_table_rec) is shared across every request
+        # the server handles concurrently. Confirmed via a real crash
+        # (RuntimeError: mismatched attention key/value shapes inside
+        # TableRecPredictor's decoder) that these models are NOT safe to call
+        # from multiple threads at once -- likely internal autoregressive/
+        # KV-cache state on the model getting corrupted by interleaved calls.
+        # Separate locks (not one shared lock) so a request's _det call and
+        # another request's _table_rec call can still overlap.
+        self._det_lock = threading.Lock()
+        self._table_rec_lock = threading.Lock()
 
     @staticmethod
     def _crop_with_margin(image: Image.Image, bbox, margin: int = 3) -> Image.Image:
@@ -151,12 +150,11 @@ class SuryaWirelessTableProcessor:
 
         return '<table border="1" cellspacing="0" cellpadding="4">\n' + "\n".join(html_rows) + "\n</table>"
 
-    def __call__(self, img: np.ndarray) -> str:
-        html = self.call_batch([img])[0]
-        self.last_ocr_result = self.last_ocr_results[0]
-        return html
+    def __call__(self, img: np.ndarray) -> tuple[str, list]:
+        htmls, ocr_results = self.call_batch([img])
+        return htmls[0], ocr_results[0]
 
-    def call_batch(self, imgs: list[np.ndarray]) -> list[str]:
+    def call_batch(self, imgs: list[np.ndarray]) -> tuple[list[str], list[list]]:
         """Batches `TableRecPredictor` + `DetectionPredictor` across
         MULTIPLE table crops in ONE call each, instead of __call__()'s
         one-crop-at-a-time path.
@@ -182,17 +180,22 @@ class SuryaWirelessTableProcessor:
         line -- predict_batch() handles the variable-width padding/masking
         correctly (see fastocr/tool/predictor.py).
 
-        Returns one HTML string per input image, in the SAME ORDER as
-        `imgs`. Also refreshes `self.last_ocr_results` (parallel list, one
-        ocr_result per image) for the caller's debug overlay.
+        Returns `(html_list, ocr_results_per_image)` -- one HTML string and
+        one ocr_result list per input image, both in the SAME ORDER as
+        `imgs`. Returned directly (not stashed on `self`) because this
+        instance is shared across every request the server handles
+        concurrently -- storing "the last call's result" as instance state
+        would let one request's data leak into another's if two calls
+        overlap.
         """
         if not imgs:
-            self.last_ocr_results = []
-            return []
+            return [], []
 
         pil_imgs = [Image.fromarray(img).convert("RGB") for img in imgs]
-        table_preds = self._table_rec(pil_imgs, batch_size=self._max_batch_size)
-        det_preds = self._det(pil_imgs, batch_size=self._max_batch_size)
+        with self._table_rec_lock:
+            table_preds = self._table_rec(pil_imgs, batch_size=self._max_batch_size)
+        with self._det_lock:
+            det_preds = self._det(pil_imgs, batch_size=self._max_batch_size)
 
         # Flatten every detected text-line crop across ALL images into one
         # list first, so FastOCR recognizes the whole document's table
@@ -225,9 +228,8 @@ class SuryaWirelessTableProcessor:
         for owner, quad, (text, score) in zip(owner_idx, flat_quads, flat_texts_scores):
             ocr_results_per_image[owner].append([quad, html_module.escape(text), score])
 
-        self.last_ocr_results = ocr_results_per_image
         results = []
         for table_pred, ocr_result in zip(table_preds, ocr_results_per_image):
             cell_text_map = self._fill_cell_texts(table_pred.cells, ocr_result)
             results.append(self._build_html_table(table_pred.cells, cell_text_map))
-        return results
+        return results, ocr_results_per_image

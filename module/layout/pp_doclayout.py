@@ -1,6 +1,7 @@
 import logging
 import os
 import tempfile
+import threading
 
 import cv2
 import numpy as np
@@ -27,7 +28,7 @@ class PPDocLayoutBackend:
     label_schema = LayoutLabelSchema(
         table_types=frozenset({"table"}),
         skip_types=frozenset({
-            "seal", "image", "chart", "formula", "formula_number",
+            "image", "chart", "formula", "formula_number",
             "algorithm", "number", "aside_text", "footnote",
         }),
         title_types=frozenset({"doc_title"}),
@@ -46,6 +47,16 @@ class PPDocLayoutBackend:
         # than fit in GPU memory at once doesn't OOM just because we handed
         # it every page in one detect_batch() call.
         self._max_batch_size = max_batch_size
+        # PaddleX's underlying Paddle Inference Predictor is NOT safe to call
+        # concurrently from multiple threads on the SAME instance -- confirmed
+        # via a real crash (InvalidArgumentError: Broadcast dimension
+        # mismatch) when two overlapping requests both called predict() on
+        # this shared model at the same time. This instance is shared across
+        # every request (built once in build_pipeline()), so this lock
+        # serializes actual inference calls into it -- other parts of a
+        # request (upload, PDF render, OCR, table processing) can still
+        # proceed concurrently; only the layout model call itself queues.
+        self._predict_lock = threading.Lock()
 
     def detect(self, image: Image.Image, threshold: float) -> list[LayoutBlock]:
         return self.detect_batch([image], threshold)[0]
@@ -102,8 +113,9 @@ class PPDocLayoutBackend:
                 tmp_paths.append(tmp_path)
 
             batch_size = min(len(tmp_paths), self._max_batch_size)
-            output = self._model.predict(tmp_paths, batch_size=batch_size, layout_nms=True)
-            paddle_results = list(output)
+            with self._predict_lock:
+                output = self._model.predict(tmp_paths, batch_size=batch_size, layout_nms=True)
+                paddle_results = list(output)
         finally:
             for tmp_path in tmp_paths:
                 if os.path.exists(tmp_path):

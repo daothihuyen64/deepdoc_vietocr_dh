@@ -16,6 +16,7 @@
 
 import logging
 import copy
+import threading
 import time
 import os
 
@@ -116,7 +117,7 @@ def load_model(model_dir, nm, device_id: int | None = None):
         }
         sess = ort.InferenceSession(
             model_file_path,
-            options=options,
+            sess_options=options,
             providers=['CUDAExecutionProvider'],
             provider_options=[cuda_provider_options]
             )
@@ -125,7 +126,7 @@ def load_model(model_dir, nm, device_id: int | None = None):
     else:
         sess = ort.InferenceSession(
             model_file_path,
-            options=options,
+            sess_options=options,
             providers=['CPUExecutionProvider'])
         run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu")
         logging.info(f"[device] load_model {model_file_path} uses CPU")
@@ -375,6 +376,15 @@ class OCR:
         # many pages/table crops from OOMing GPU memory just because every
         # image got handed to one batched call.
         self._det_max_batch_size = det_max_batch_size
+        # self.text_detector[i] is shared across every request the server
+        # handles concurrently -- confirmed via real crashes that shared
+        # Paddle/PyTorch model instances are NOT necessarily safe to call
+        # from multiple threads at once (layout's Paddle predictor, Surya's
+        # decoder), so each detector's own forward pass is serialized here
+        # too. One lock PER DEVICE, not one global lock -- if PARALLEL_DEVICES
+        # spans multiple independent GPUs, requests hitting DIFFERENT devices
+        # should still run fully in parallel.
+        self._detect_locks = [threading.Lock() for _ in self.text_detector]
 
     @staticmethod
     def _pad_quad(points, pad_px_h, pad_px_w):
@@ -486,7 +496,8 @@ class OCR:
         """
         if device_id is None:
             device_id = 0
-        dt_boxes, _elapse = self.text_detector[device_id](img_bgr)
+        with self._detect_locks[device_id]:
+            dt_boxes, _elapse = self.text_detector[device_id](img_bgr)
         if dt_boxes is None or len(dt_boxes) == 0:
             return None
         return dt_boxes
@@ -545,7 +556,8 @@ class OCR:
         if not hasattr(detector, "batch_predict"):
             return [self.detect_raw(img, device_id) for img in img_list]
 
-        batch_results = detector.batch_predict(img_list, max_batch_size=effective_max_batch_size)
+        with self._detect_locks[device_id]:
+            batch_results = detector.batch_predict(img_list, max_batch_size=effective_max_batch_size)
         if len(batch_results) != len(img_list):
             raise RuntimeError(
                 f"Detector batch_predict returned {len(batch_results)} results "

@@ -160,7 +160,10 @@ class DocumentPipeline:
                 json.dump(json_out, f, ensure_ascii=False, indent=2)
             with open(os.path.join(out_dir, "output.md"), "w", encoding="utf-8") as f:
                 f.write(markdown)
-            results.append({"file": label, "status": "success", "output_dir": out_dir})
+            results.append({
+                "file": label, "status": "success", "output_dir": out_dir,
+                "json": json_out, "markdown": markdown,
+            })
 
         return results
 
@@ -205,7 +208,10 @@ class DocumentPipeline:
                 json.dump(json_out, f, ensure_ascii=False, indent=2)
             with open(os.path.join(out_dir, "output.md"), "w", encoding="utf-8") as f:
                 f.write(markdown)
-            results.append({"file": label, "status": "success", "output_dir": out_dir})
+            results.append({
+                "file": label, "status": "success", "output_dir": out_dir,
+                "json": json_out, "markdown": markdown,
+            })
 
         return results
 
@@ -313,17 +319,14 @@ class DocumentPipeline:
         if all_table_items:
             t_tables = time.time()
             if hasattr(self.table_processor, "process_batch"):
-                contents = self.table_processor.process_batch(all_table_items, debug_dir=debug_dir)
-                kinds = getattr(self.table_processor, "last_table_kinds", None) or [None] * len(all_table_items)
+                contents, kinds = self.table_processor.process_batch(all_table_items, debug_dir=debug_dir)
             else:
+                # Only the tsr backend takes this path, which has no
+                # wire/wireless concept at all -- kind is always None here.
                 contents, kinds = [], []
                 for pn, tno, crop in all_table_items:
                     contents.append(self.table_processor(crop, debug_dir=debug_dir, pn=pn, tno=tno))
-                    # last_table_kind ("wire"/"wireless") is only set by the
-                    # mineru backend (see MinerUTableProcessor) after it has
-                    # classified this crop -- the tsr backend has no such
-                    # concept, so getattr falls back to no suffix for it.
-                    kinds.append(getattr(self.table_processor, "last_table_kind", None))
+                    kinds.append(None)
             logger.info(
                 "Processed %d table(s) (batched across whole document) in %.2fs",
                 len(all_table_items), time.time() - t_tables,

@@ -1,4 +1,5 @@
 import logging
+import threading
 
 import torch
 
@@ -16,6 +17,14 @@ class Predictor:
         self.model = model
         self.vocab = vocab
         self.device = device
+        # This Predictor is shared across every request the server handles
+        # (built once per device in OCR.__init__, reused everywhere). Surya's
+        # TableRecPredictor crashed under real concurrent load with mismatched
+        # attention key/value shapes -- decoder models with internal
+        # autoregressive state are NOT necessarily safe to call from multiple
+        # threads at once, so this model's own forward pass is serialized too
+        # rather than assuming it's fine without evidence.
+        self._predict_lock = threading.Lock()
 
     def predict(self, img, return_prob=False):
         text, prob = self.predict_batch([img])[0]
@@ -53,7 +62,8 @@ class Predictor:
         img = img.to(self.device)
         src_lengths = src_lengths.to(self.device)
 
-        sent, prob = translate(img, self.model, src_lengths=src_lengths)
+        with self._predict_lock:
+            sent, prob = translate(img, self.model, src_lengths=src_lengths)
 
         results = []
         for i in range(len(imgs)):

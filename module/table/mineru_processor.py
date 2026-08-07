@@ -1,5 +1,6 @@
 import html as html_module
 import logging
+import threading
 import time
 import traceback
 
@@ -11,6 +12,41 @@ from ..pipeline.debug import save_table_ocr_debug
 from .surya_wireless import SuryaWirelessTableProcessor
 
 logger = logging.getLogger(__name__)
+
+# table_cls (RapidAI) and mineru's own atom models (TableOrientationCls,
+# WiredTable/UNet) each build their own onnxruntime InferenceSession with
+# library defaults -- unlike module/ocr/engine.py's detector session,
+# nothing in this project's code otherwise controls their SessionOptions.
+# Default ORT CPU-arena behavior is a bump/pool allocator that grows to the
+# peak batch seen so far and never shrinks back on its own; since these
+# sessions are process-lifetime singletons (built once in
+# _load_table_models(), reused for every request), whatever peak a large
+# multi-table document hits stays reserved for the rest of the process's
+# life -- invisible to gc.collect()/malloc_trim() alike, because it's ORT's
+# own C++-owned arena, not a Python-tracked object and not a genuinely-free
+# malloc chunk. Patching InferenceSession.__init__ IN PLACE (mutating the
+# class itself, not reassigning `ort.InferenceSession`) reaches every
+# already-imported reference to the class too, however table_cls/mineru
+# imported it -- __init__ is looked up on the class object at call time, so
+# this only needs to run before any session is actually CONSTRUCTED (i.e.
+# before MinerUTableProcessor._load_table_models() runs at pipeline-build
+# time), not before onnxruntime itself was imported.
+import onnxruntime as _ort  # noqa: E402
+
+_orig_ort_session_init = _ort.InferenceSession.__init__
+
+
+def _patched_ort_session_init(self, path_or_bytes, sess_options=None, providers=None, provider_options=None, **kwargs):
+    if sess_options is None:
+        sess_options = _ort.SessionOptions()
+    sess_options.enable_cpu_mem_arena = False
+    _orig_ort_session_init(
+        self, path_or_bytes, sess_options=sess_options,
+        providers=providers, provider_options=provider_options, **kwargs,
+    )
+
+
+_ort.InferenceSession.__init__ = _patched_ort_session_init
 
 # MinerU's UNet wired-table cell recovery joins the OCR text fragments
 # matched to the same cell with no separator, which drops the space at
@@ -391,14 +427,6 @@ class MinerUTableProcessor:
         # same-shaped wired tables doesn't still hand an unbounded number
         # of them to one ONNX call within a single shape group.
         self._wired_max_batch_size = wired_max_batch_size
-        # Set by __call__ once TableCls has run -- "wire" or "wireless".
-        # Read by document_pipeline.py (via getattr, since only this backend
-        # has the concept) to suffix the deskewed-crop debug filename.
-        self.last_table_kind: str | None = None
-        # Set by process_batch() -- one kind ("wire"/"wireless") per item in
-        # the last batch call, same order (last_table_kind above is only
-        # meaningful for the single-crop __call__ path).
-        self.last_table_kinds: list[str] = []
         self._load_table_models()
 
     def _load_table_models(self) -> None:
@@ -430,6 +458,17 @@ class MinerUTableProcessor:
             "[device] Surya (wireless table structure + detector): device=%s",
             "cuda" if torch.cuda.is_available() else "cpu",
         )
+        # self._ori_cls/_table_cls/_wired are shared across every request the
+        # server handles concurrently. Confirmed via real crashes (Paddle's
+        # layout predictor, Surya's decoder) that shared model instances are
+        # NOT necessarily safe to call from multiple threads at once, so
+        # every model call here is serialized too rather than assumed safe
+        # without evidence. Separate locks per model so a request's
+        # orientation-cls call doesn't block another request's wired-table
+        # call at the same time.
+        self._ori_cls_lock = threading.Lock()
+        self._table_cls_lock = threading.Lock()
+        self._wired_lock = threading.Lock()
 
     @staticmethod
     def _to_rgb(image) -> np.ndarray:
@@ -450,7 +489,8 @@ class MinerUTableProcessor:
     def _fix_orientation(self, img: np.ndarray) -> np.ndarray:
         import cv2
 
-        label = str(self._ori_cls.predict(img) or "0")
+        with self._ori_cls_lock:
+            label = str(self._ori_cls.predict(img) or "0")
         if label == "270":
             return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
         if label == "90":
@@ -476,9 +516,10 @@ class MinerUTableProcessor:
         fixed = []
         for start in range(0, len(imgs), self._max_batch_size):
             chunk = imgs[start:start + self._max_batch_size]
-            labels = self._ori_cls.batch_predict(
-                [{"table_img": img} for img in chunk], det_batch_size=self._max_batch_size
-            )
+            with self._ori_cls_lock:
+                labels = self._ori_cls.batch_predict(
+                    [{"table_img": img} for img in chunk], det_batch_size=self._max_batch_size
+                )
             for img, label in zip(chunk, labels):
                 label = str(label or "0")
                 if label == "270":
@@ -554,7 +595,8 @@ class MinerUTableProcessor:
         # table_cls's LoadImage leaves a raw ndarray untouched (assumes it's
         # already BGR, cv2's native order) -- our img is RGB.
         bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        label, _elapse = self._table_cls(bgr)
+        with self._table_cls_lock:
+            label, _elapse = self._table_cls(bgr)
         return label == "wired"
 
     @staticmethod
@@ -579,13 +621,13 @@ class MinerUTableProcessor:
         img = self._fix_orientation(img)
 
         is_wired = self._is_wired(img)
-        self.last_table_kind = "wire" if is_wired else "wireless"
-        logger.info("Page %d table %d: classified as %s", pn + 1, tno, self.last_table_kind)
+        kind = "wire" if is_wired else "wireless"
+        logger.info("Page %d table %d: classified as %s", pn + 1, tno, kind)
 
         # Wireless (Surya) always runs -- baseline for every table, and the
         # fallback candidate MinerU's own compare heuristic below can pick
         # instead of wired.
-        wireless_html = self._surya(img)
+        wireless_html, surya_ocr_result = self._surya(img)
 
         if is_wired:
             # Shared detector -- feeds the wired model's own recognition AND
@@ -593,7 +635,8 @@ class MinerUTableProcessor:
             # matched-text against for both candidates.
             ocr_result = self._run_ocr(img)
             if ocr_result:
-                result = self._wired.predict(img, ocr_result, wireless_html, return_metadata=True)
+                with self._wired_lock:
+                    result = self._wired.predict(img, ocr_result, wireless_html, return_metadata=True)
                 final_html = result["html"]
                 logger.info(
                     "Page %d table %d: wired-vs-wireless compare -> selected %s",
@@ -602,7 +645,7 @@ class MinerUTableProcessor:
             else:
                 final_html = wireless_html
         else:
-            ocr_result = self._surya.last_ocr_result
+            ocr_result = surya_ocr_result
             final_html = wireless_html
 
         logger.debug("OCR found %d text boxes", len(ocr_result))
@@ -611,7 +654,7 @@ class MinerUTableProcessor:
                 Image.fromarray(img),
                 [(box, (text, score)) for box, text, score in ocr_result],
                 debug_dir, pn, tno,
-                suffix=f"_{self.last_table_kind}",
+                suffix=f"_{kind}",
             )
 
         return self._trim_to_table_tag(final_html or wireless_html)
@@ -620,7 +663,7 @@ class MinerUTableProcessor:
         self,
         items: list[tuple[int, int, Image.Image]],
         debug_dir: str | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str]]:
         """Batches across ALL given table crops in ONE call each, instead of
         __call__()'s one-crop-at-a-time path, for every model that exposes
         a batch API:
@@ -646,16 +689,19 @@ class MinerUTableProcessor:
         library exposes no batch API at all.
 
         `items` is a list of (pn, tno, crop) -- pn/tno are only used for
-        logging/debug filenames, not for anything semantic. Returns one
-        HTML content string per item, in the SAME ORDER as `items`, and
-        refreshes `self.last_table_kinds` (parallel list) for the caller's
-        debug-filename suffix.
+        logging/debug filenames, not for anything semantic. Returns
+        `(contents, kinds)` -- one HTML content string and one kind
+        ("wire"/"wireless") per item, both in the SAME ORDER as `items`.
+        Returned directly (not stashed on `self`) because this instance is
+        shared across every request the server handles concurrently --
+        storing "the last batch's kinds" as instance state would let one
+        request's classifications leak into another's if two calls overlap
+        (this previously crashed with IndexError under concurrent requests).
         """
         import cv2
 
         if not items:
-            self.last_table_kinds = []
-            return []
+            return [], []
 
         rgb_imgs = [self._to_rgb(crop) for _pn, _tno, crop in items]
         fixed_imgs = self._fix_orientation_batch(rgb_imgs)
@@ -665,8 +711,7 @@ class MinerUTableProcessor:
             is_wired = self._is_wired(img)  # no batch API -- stays per-crop
             prepared.append((pn, tno, img, is_wired))
 
-        wireless_htmls = self._surya.call_batch([p[2] for p in prepared])
-        surya_ocr_results = list(self._surya.last_ocr_results)
+        wireless_htmls, surya_ocr_results = self._surya.call_batch([p[2] for p in prepared])
 
         # Shared detector, batched across ALL wired-classified crops.
         wired_positions = [i for i, p in enumerate(prepared) if p[3]]
@@ -680,10 +725,10 @@ class MinerUTableProcessor:
             for i, bgr, dt_boxes in zip(wired_positions, wired_bgrs, wired_dt_boxes_batch)
         }
 
-        self.last_table_kinds = [
+        kinds = [
             "wire" if is_wired else "wireless" for _pn, _tno, _img, is_wired in prepared
         ]
-        for (pn, tno, _img, _is_wired), kind in zip(prepared, self.last_table_kinds):
+        for (pn, tno, _img, _is_wired), kind in zip(prepared, kinds):
             logger.info("Page %d table %d: classified as %s", pn + 1, tno, kind)
 
         # Wired (UNet) structure model, batched across ALL wired-classified
@@ -707,12 +752,13 @@ class MinerUTableProcessor:
         ]
         for start in range(0, len(table_res_list), self._wired_max_batch_size):
             chunk = table_res_list[start : start + self._wired_max_batch_size]
-            self._wired.batch_predict(chunk)
+            with self._wired_lock:
+                self._wired.batch_predict(chunk)
         wired_html_by_pos = dict(zip(wired_positions, table_res_list))
 
         results = []
         for i, (pn, tno, img, is_wired) in enumerate(prepared):
-            kind = self.last_table_kinds[i]
+            kind = kinds[i]
             wireless_html = wireless_htmls[i]
 
             if is_wired:
@@ -739,4 +785,4 @@ class MinerUTableProcessor:
 
             results.append(self._trim_to_table_tag(final_html or wireless_html))
 
-        return results
+        return results, kinds

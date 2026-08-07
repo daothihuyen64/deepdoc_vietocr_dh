@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+
+
 COPY requirements.txt .
 # Install the CPU-only torch/torchvision wheels instead of the default PyPI
 # build (which bundles CUDA/cuDNN we never use -- TextRecognizer forces
